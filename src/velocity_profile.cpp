@@ -29,6 +29,174 @@ double segmentDt(double v_prev, double v_curr, double ds) {
     return ds / std::max(kMinTimeSpeed, v_avg);
 }
 
+std::vector<double> arcLengths(const std::vector<Pose2D>& path) {
+    std::vector<double> s(path.size(), 0.0);
+    for (size_t i = 1; i < path.size(); ++i) {
+        s[i] = s[i - 1] + arcLength(path[i - 1], path[i]);
+    }
+    return s;
+}
+
+bool segmentBoundaryAfter(const std::vector<Pose2D>& path, size_t i) {
+    return i + 1 < path.size() && path[i + 1].direction != path[i].direction;
+}
+
+std::vector<double> zeroPhaseArcLengthLowPass(
+    const std::vector<Pose2D>& path,
+    const std::vector<double>& s,
+    const std::vector<double>& input,
+    double smoothing_length) {
+    const size_t n = input.size();
+    if (n < 3 || path.size() != n || s.size() != n || smoothing_length <= 1e-9) {
+        return input;
+    }
+
+    std::vector<double> output = input;
+    size_t run_start = 0;
+    while (run_start < n) {
+        size_t run_end = run_start;
+        while (run_end + 1 < n &&
+               path[run_end + 1].direction == path[run_start].direction) {
+            ++run_end;
+        }
+
+        if (run_end <= run_start + 1) {
+            run_start = run_end + 1;
+            continue;
+        }
+
+        std::vector<double> forward(run_end - run_start + 1, 0.0);
+        forward.front() = input[run_start];
+        for (size_t i = run_start + 1; i <= run_end; ++i) {
+            const double ds = std::max(0.0, s[i] - s[i - 1]);
+            const double alpha = ds / (smoothing_length + ds);
+            const size_t local_i = i - run_start;
+            forward[local_i] = forward[local_i - 1] +
+                alpha * (input[i] - forward[local_i - 1]);
+        }
+
+        std::vector<double> backward(forward.size(), 0.0);
+        backward.back() = input[run_end];
+        for (size_t i = run_end; i > run_start; --i) {
+            const double ds = std::max(0.0, s[i] - s[i - 1]);
+            const double alpha = ds / (smoothing_length + ds);
+            const size_t local_i = i - run_start;
+            backward[local_i - 1] = backward[local_i] +
+                alpha * (forward[local_i - 1] - backward[local_i]);
+        }
+
+        for (size_t i = run_start; i <= run_end; ++i) {
+            output[i] = backward[i - run_start];
+        }
+
+        run_start = run_end + 1;
+    }
+
+    return output;
+}
+
+std::vector<double> smoothCurvatureForSpeedCeiling(
+    const std::vector<Pose2D>& path,
+    const std::vector<double>& curvature,
+    double smoothing_length) {
+    std::vector<double> abs_curvature(curvature.size(), 0.0);
+    for (size_t i = 0; i < curvature.size(); ++i) {
+        abs_curvature[i] = std::abs(curvature[i]);
+    }
+
+    const std::vector<double> s = arcLengths(path);
+    const std::vector<double> filtered = zeroPhaseArcLengthLowPass(
+        path, s, abs_curvature, smoothing_length);
+
+    // Conservative smoothing: never reduce the local curvature used for the
+    // lateral-acceleration cap.  This broadens speed reductions around curves
+    // instead of letting v_ref react to one waypoint at a time.
+    std::vector<double> safe_curvature = abs_curvature;
+    const size_t n = std::min(abs_curvature.size(), filtered.size());
+    for (size_t i = 0; i < n; ++i) {
+        safe_curvature[i] = std::max(abs_curvature[i], filtered[i]);
+    }
+    return safe_curvature;
+}
+
+std::vector<double> smoothSpeedCeilingForPreview(
+    const std::vector<Pose2D>& path,
+    const std::vector<double>& raw_ceiling,
+    double smoothing_length) {
+    const std::vector<double> s = arcLengths(path);
+    const std::vector<double> filtered = zeroPhaseArcLengthLowPass(
+        path, s, raw_ceiling, smoothing_length);
+
+    std::vector<double> ceiling = raw_ceiling;
+    const size_t n = std::min(raw_ceiling.size(), filtered.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (i == 0 || i + 1 == n || isCusp(path, i) || segmentBoundaryAfter(path, i)) {
+            ceiling[i] = 0.0;
+            continue;
+        }
+        // Keep the original pointwise ceiling as a hard safety cap.
+        ceiling[i] = std::clamp(filtered[i], 0.0, raw_ceiling[i]);
+    }
+    return ceiling;
+}
+
+void enforceAccelerationDecelerationLimits(
+    const std::vector<Pose2D>& path,
+    const VelocityProfiler::Params& params,
+    const std::vector<double>& v_ceil,
+    std::vector<double>& v) {
+    const size_t n = path.size();
+    if (n == 0 || v.size() != n || v_ceil.size() != n) return;
+
+    v.front() = 0.0;
+    for (size_t i = 1; i < n; ++i) {
+        if (isCusp(path, i)) {
+            v[i] = 0.0;
+            continue;
+        }
+
+        const double ds = arcLength(path[i - 1], path[i]);
+        const double v_allowed = std::sqrt(
+            std::max(0.0, v[i - 1] * v[i - 1] + 2.0 * params.a_max * ds));
+        v[i] = std::min({std::max(0.0, v[i]), v_ceil[i], v_allowed});
+    }
+
+    v.back() = 0.0;
+    for (int idx = static_cast<int>(n) - 2; idx >= 0; --idx) {
+        const size_t i = static_cast<size_t>(idx);
+        if (segmentBoundaryAfter(path, i)) {
+            v[i + 1] = 0.0;
+        }
+
+        const double ds = arcLength(path[i], path[i + 1]);
+        const double v_allowed = std::sqrt(
+            std::max(0.0, v[i + 1] * v[i + 1] + 2.0 * params.d_max * ds));
+        v[i] = std::min({std::max(0.0, v[i]), v_ceil[i], v_allowed});
+    }
+}
+
+void applyVelocityRounding(const std::vector<Pose2D>& path,
+                           const std::vector<double>& v_ceil,
+                           std::vector<double>& v,
+                           double smoothing_length) {
+    if (path.size() < 3 || path.size() != v.size() || v_ceil.size() != v.size()) {
+        return;
+    }
+
+    const std::vector<double> s = arcLengths(path);
+    std::vector<double> rounded = zeroPhaseArcLengthLowPass(
+        path, s, v, smoothing_length);
+
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i == 0 || i + 1 == v.size() || isCusp(path, i) ||
+            segmentBoundaryAfter(path, i)) {
+            v[i] = 0.0;
+            continue;
+        }
+        v[i] = std::clamp(rounded[i], 0.0, v_ceil[i]);
+    }
+}
+
 void applyJerkLimitedSmoothing(const std::vector<Pose2D>& path,
                                const VelocityProfiler::Params& params,
                                const std::vector<double>& v_ceil,
@@ -77,7 +245,7 @@ void applyJerkLimitedSmoothing(const std::vector<Pose2D>& path,
                 continue;
             }
 
-            const bool boundary_after = (path[i + 1].direction != path[i].direction);
+            const bool boundary_after = segmentBoundaryAfter(path, i);
             if (boundary_after) {
                 v[i + 1] = 0.0;
                 decel = 0.0;
@@ -116,23 +284,28 @@ void VelocityProfiler::compute(std::vector<Pose2D>& path,
     //   v_ceil[i] = max speed allowed at waypoint i by lateral-accel budget.
     //   Start, end, and cusp waypoints are hard zeros.
     // -----------------------------------------------------------------------
-    std::vector<double> v_ceil(n, 0.0);
+    std::vector<double> v_ceil_raw(n, 0.0);
     const std::vector<double> curvature = PathCurvature::computeAtPathPoints(
         path, curvature_resample_ds, curvature_filter_window, curvature_rate_limit);
+    const double preview_length = std::clamp(params.v_max * 0.45, 0.8, 2.0);
+    const std::vector<double> speed_curvature =
+        smoothCurvatureForSpeedCeiling(path, curvature, preview_length);
 
     for (size_t i = 1; i + 1 < n; ++i) {
         if (isCusp(path, i)) {
-            v_ceil[i] = 0.0;
+            v_ceil_raw[i] = 0.0;
             continue;
         }
         const double v_max_i = (path[i].direction < 0)
             ? params.v_max_reverse : params.v_max;
 
-        const double k = (i < curvature.size()) ? std::abs(curvature[i]) : 0.0;
-        v_ceil[i] = (k < safe_curvature_eps)
+        const double k = (i < speed_curvature.size()) ? speed_curvature[i] : 0.0;
+        v_ceil_raw[i] = (k < safe_curvature_eps)
             ? v_max_i
             : curvatureSpeedLimit(k, params.a_lat_max, params.v_min_curv, v_max_i);
     }
+    const std::vector<double> v_ceil = smoothSpeedCeilingForPreview(
+        path, v_ceil_raw, preview_length);
     // v_ceil[0] = 0 and v_ceil[n-1] = 0 from initialisation — vehicle starts
     // and stops at rest.
 
@@ -174,6 +347,9 @@ void VelocityProfiler::compute(std::vector<Pose2D>& path,
         v[ui] = std::min(v[ui], v_decel);
     }
 
+    applyJerkLimitedSmoothing(path, params, v_ceil, v);
+    applyVelocityRounding(path, v_ceil, v, std::clamp(preview_length * 0.5, 0.5, 1.0));
+    enforceAccelerationDecelerationLimits(path, params, v_ceil, v);
     applyJerkLimitedSmoothing(path, params, v_ceil, v);
 
     // Write back — always non-negative (sign carried by direction field).

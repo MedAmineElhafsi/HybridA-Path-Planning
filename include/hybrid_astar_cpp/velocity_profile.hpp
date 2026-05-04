@@ -8,11 +8,12 @@
 // path.
 //
 // Algorithm (three passes):
-//   1. Curvature pass  — limits speed at each waypoint by lateral-acceleration budget.
+//   1. Curvature pass  — builds a conservative preview-smoothed speed ceiling
+//                        from the lateral-acceleration budget.
 //   2. Forward pass    — limits acceleration from the previous waypoint.
 //   3. Backward pass   — limits deceleration toward the next waypoint.
-//   4. Jerk pass       — rounds acceleration/deceleration ramps into an
-//                        S-curve-like profile.
+//   4. Rounding pass   — jerk-limits and lightly low-passes the result into an
+//                        S-curve-like professor-style reference profile.
 //
 // Curvature for the lateral-acceleration pass uses the same professor-style
 // derivative kappa(s) pipeline as /astar_curvature: B-spline path, uniform
