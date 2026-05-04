@@ -25,6 +25,7 @@ from nav_msgs.msg import OccupancyGrid, Path, Odometry
 from std_msgs.msg import Float64MultiArray
 
 REFERENCE_FIELDS = ("x", "y", "yaw", "v_ref", "t", "kappa", "delta", "a")
+STOP_SPEED_EPS = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -36,84 +37,6 @@ def arc_lengths(pts):
         s.append(s[-1] + math.hypot(pts[i][0]-pts[i-1][0],
                                      pts[i][1]-pts[i-1][1]))
     return s
-
-def resample_uniform_arclength(pts, target_ds=0.05):
-    """Return (s, xy) resampled at near-constant arc-length spacing."""
-    if len(pts) < 2:
-        return [0.0]*len(pts), list(pts)
-
-    s_src = arc_lengths(pts)
-    length = s_src[-1]
-    if length <= 1e-9:
-        return [0.0], [pts[0]]
-
-    intervals = max(1, int(math.ceil(length / max(target_ds, 0.01))))
-    ds = length / intervals
-    out_s = [i*ds for i in range(intervals)]
-    out_s.append(length)
-
-    out_pts = []
-    src_i = 1
-    for target_s in out_s:
-        while src_i < len(s_src)-1 and s_src[src_i] < target_s:
-            src_i += 1
-
-        lo = max(0, src_i-1)
-        hi = src_i
-        denom = s_src[hi] - s_src[lo]
-        if denom <= 1e-9:
-            out_pts.append(pts[hi])
-            continue
-
-        t = min(1.0, max(0.0, (target_s - s_src[lo]) / denom))
-        x = pts[lo][0] + t*(pts[hi][0] - pts[lo][0])
-        y = pts[lo][1] + t*(pts[hi][1] - pts[lo][1])
-        out_pts.append((x, y))
-
-    return out_s, out_pts
-
-def moving_average(values, window=5):
-    window = max(1, int(window))
-    if window % 2 == 0:
-        window += 1
-    if window <= 1 or len(values) < 3:
-        return list(values)
-
-    half = window // 2
-    filtered = [0.0]*len(values)
-    for i in range(len(values)):
-        if i == 0 or i == len(values)-1:
-            continue
-        lo = max(1, i-half)
-        hi = min(len(values)-2, i+half)
-        filtered[i] = sum(values[lo:hi+1]) / (hi-lo+1)
-    return filtered
-
-def derivative_curvature_profile(pts, target_ds=0.05, filter_window=1):
-    """Signed kappa(s) from x', y', x'', y'' on uniformly resampled points."""
-    s, samples = resample_uniform_arclength(pts, target_ds)
-    n = len(samples)
-    k = [0.0]*n
-    if n < 3:
-        return s, k
-
-    for i in range(1, n-1):
-        ds_prev = s[i] - s[i-1]
-        ds_next = s[i+1] - s[i]
-        ds = 0.5*(ds_prev + ds_next)
-        if ds <= 1e-9:
-            continue
-
-        x_prime = (samples[i+1][0] - samples[i-1][0]) / (2.0*ds)
-        y_prime = (samples[i+1][1] - samples[i-1][1]) / (2.0*ds)
-        x_second = (samples[i+1][0] - 2.0*samples[i][0] + samples[i-1][0]) / (ds*ds)
-        y_second = (samples[i+1][1] - 2.0*samples[i][1] + samples[i-1][1]) / (ds*ds)
-
-        denom = (x_prime*x_prime + y_prime*y_prime)**1.5
-        if denom > 1e-9:
-            k[i] = (x_prime*y_second - y_prime*x_second) / denom
-
-    return s, moving_average(k, filter_window)
 
 def curvature_topic_axis(pts, curv):
     if not curv:
@@ -127,6 +50,81 @@ def curvature_topic_axis(pts, curv):
     if len(curv) == 1:
         return [0.0], curv
     return list(np.linspace(0.0, total, len(curv))), curv
+
+def trim_pair(x, y):
+    n = min(len(x), len(y))
+    return list(x[:n]), list(y[:n])
+
+def stop_break_indices(v, threshold=STOP_SPEED_EPS):
+    """Interior zero-speed groups indicate a cusp or segment boundary."""
+    n = len(v)
+    if n < 5:
+        return []
+
+    breaks = []
+    start = None
+    for i in range(1, n-1):
+        stopped = abs(v[i]) <= threshold
+        if stopped and start is None:
+            start = i
+        elif not stopped and start is not None:
+            end = i - 1
+            if start > 1 and end < n - 2:
+                breaks.append((start + end) // 2)
+            start = None
+
+    if start is not None:
+        end = n - 2
+        if start > 1 and end < n - 2:
+            breaks.append((start + end) // 2)
+    return breaks
+
+def plot_segmented(ax, x, y, color, label, linewidth=1.5,
+                   fill_alpha=0.0, break_indices=None):
+    x, y = trim_pair(x, y)
+    if not x:
+        return
+
+    breaks = sorted({i for i in (break_indices or []) if 0 <= i < len(x)-1})
+    first = True
+    start = 0
+    for break_i in breaks + [len(x)-1]:
+        end = break_i + 1
+        if end > start:
+            seg_x = x[start:end]
+            seg_y = y[start:end]
+            ax.plot(seg_x, seg_y, color=color, linewidth=linewidth,
+                    label=label if first else None)
+            if fill_alpha > 0.0:
+                ax.fill_between(seg_x, seg_y, alpha=fill_alpha, color=color)
+            first = False
+        start = end
+
+def mark_segment_breaks(ax, x, break_indices):
+    x = list(x)
+    first = True
+    for i in break_indices:
+        if 0 <= i < len(x):
+            ax.axvline(x[i], color=ORANGE, linestyle=":",
+                       linewidth=0.9, alpha=0.65,
+                       label="stop / cusp" if first else None)
+            first = False
+
+def set_padded_ylim(ax, values, min_span=0.05):
+    finite = [v for v in values if math.isfinite(v)]
+    if not finite:
+        return
+    lo = min(min(finite), 0.0)
+    hi = max(max(finite), 0.0)
+    span = max(hi - lo, min_span)
+    pad = 0.15 * span
+    ax.set_ylim(lo - pad, hi + pad)
+
+def show_legend(ax, loc="best"):
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(fontsize=6, loc=loc, facecolor="#3b3b4b",
+                  labelcolor="white", framealpha=0.7)
 
 def reference_from_msg(msg):
     cols = len(REFERENCE_FIELDS)
@@ -313,7 +311,7 @@ class LiveDashboard:
 
         self.fig = plt.figure(figsize=(19, 11))
         self.fig.patch.set_facecolor("#1e1e2e")
-        plt.suptitle("Hybrid A* Reference Trajectory",
+        plt.suptitle("Reference Trajectory Generation",
                      color="white", fontsize=14, fontweight="bold")
 
         gs = gridspec.GridSpec(3, 2,
@@ -366,16 +364,23 @@ class LiveDashboard:
             ax.plot(rx, ry, color=GRAY, linestyle="--",
                     linewidth=1.0, alpha=0.6, label="Raw A*", zorder=2)
 
-        if d["smooth"] and d["smooth"].poses:
-            pts = path_to_xy(d["smooth"])
-            sx, sy = zip(*pts)
-            ax.plot(sx, sy, color=BLUE, linewidth=1.8,
-                    label="B-Spline + arc-length knots", zorder=3)
-            ax.plot(sx[0],  sy[0],  "o", color=GREEN,  markersize=6, zorder=5)
-            ax.plot(sx[-1], sy[-1], "*", color=RED,    markersize=9, zorder=5)
+        ref_pts = reference_xy(d["ref"])
+        display_pts = ref_pts
+        display_label = "Reference trajectory"
+        if not display_pts and d["smooth"] and d["smooth"].poses:
+            display_pts = path_to_xy(d["smooth"])
+            display_label = "B-spline smoothed path"
 
-        ax.legend(fontsize=6, loc="upper left",
-                  facecolor="#3b3b4b", labelcolor="white", framealpha=0.7)
+        if display_pts:
+            sx, sy = zip(*display_pts)
+            ax.plot(sx, sy, color=BLUE, linewidth=1.8,
+                    label=display_label, zorder=3)
+            ax.plot(sx[0],  sy[0],  "o", color=GREEN, markersize=6,
+                    label="Start", zorder=5)
+            ax.plot(sx[-1], sy[-1], "*", color=RED, markersize=9,
+                    label="Goal", zorder=5)
+
+        show_legend(ax, loc="upper left")
         ax.set_aspect("equal"); ax.grid(True, alpha=0.15, color="white")
         ax.tick_params(colors="white", labelsize=6)
 
@@ -386,37 +391,33 @@ class LiveDashboard:
         ax.set_facecolor("#2b2b3b")
         ax.set_title("2 — Curvature κ(s)", fontsize=9, color="white")
         ax.set_xlabel("Arc length s (m)", fontsize=7)
-        ax.set_ylabel("κ (rad/m)", fontsize=7)
-
-        if d["raw"] and d["raw"].poses:
-            pts = path_to_xy(d["raw"])
-            s_raw, k_raw = derivative_curvature_profile(
-                pts, target_ds=0.05, filter_window=1)
-            ax.plot(s_raw, k_raw, color=GRAY, linestyle="--",
-                    linewidth=1.0, alpha=0.7, label="Raw curvature")
+        ax.set_ylabel("κ (1/m)", fontsize=7)
 
         ref_pts = reference_xy(d["ref"])
         if ref_pts and d["ref"].get("kappa"):
-            s = arc_lengths(ref_pts)
-            k = d["ref"]["kappa"][:len(s)]
-            ax.plot(s, k, color=BLUE, linewidth=1.6,
-                    label="Reference kappa")
-            ax.fill_between(s, k, alpha=0.12, color=BLUE)
+            # Professor-facing plot: use backend κ from the assembled
+            # reference trajectory.  The script only computes s for the x-axis.
+            n = min(len(ref_pts), len(d["ref"]["kappa"]))
+            s = arc_lengths(ref_pts[:n])
+            k = d["ref"]["kappa"][:n]
+            plot_segmented(ax, s, k, BLUE, "Reference κ(s)",
+                           linewidth=1.8, fill_alpha=0.12)
+            set_padded_ylim(ax, k, min_span=0.05)
         elif d["smooth"] and d["smooth"].poses:
             pts = path_to_xy(d["smooth"])
             s, k = curvature_topic_axis(pts, d["curv"])
-            label = "Improved /astar_curvature"
-            if not k:
-                s, k = derivative_curvature_profile(
-                    pts, target_ds=0.05, filter_window=5)
-                label = "Smooth derivative"
             if k:
-                ax.plot(s, k, color=BLUE, linewidth=1.6, label=label)
-                ax.fill_between(s, k, alpha=0.12, color=BLUE)
+                plot_segmented(ax, s, k, BLUE, "/astar_curvature",
+                               linewidth=1.8, fill_alpha=0.12)
+                set_padded_ylim(ax, k, min_span=0.05)
+        elif d["curv"]:
+            s = list(np.arange(len(d["curv"]), dtype=float))
+            plot_segmented(ax, s, d["curv"], BLUE, "/astar_curvature",
+                           linewidth=1.8, fill_alpha=0.12)
+            set_padded_ylim(ax, d["curv"], min_span=0.05)
 
         ax.axhline(0.0, color="white", linewidth=0.6, alpha=0.35)
-        ax.legend(fontsize=6, facecolor="#3b3b4b",
-                  labelcolor="white", framealpha=0.7)
+        show_legend(ax)
         ax.grid(True, alpha=0.15, color="white")
         ax.tick_params(colors="white", labelsize=6)
 
@@ -449,20 +450,17 @@ class LiveDashboard:
             n = min(len(x), len(v))
             x = x[:n]
             v = v[:n]
-            ax.plot(x, v, color=RED, linewidth=1.8, label=label)
-            ax.fill_between(x, v, alpha=0.15, color=RED)
-            for i in range(1, n):
-                if v[i] < 0.05 and 0 < i < n-1:
-                    ax.axvline(x[i], color=ORANGE, linestyle=":",
-                               linewidth=0.9, alpha=0.6)
+            breaks = stop_break_indices(v) if xlabel.startswith("Time") else []
+            plot_segmented(ax, x, v, RED, label, linewidth=1.8,
+                           fill_alpha=0.15, break_indices=breaks)
+            mark_segment_breaks(ax, x, breaks)
             if v:
                 v_max = max(v)
-                ax.set_ylim(0, v_max * 1.15)
+                ax.set_ylim(0, max(v_max * 1.15, 0.5))
                 ax.axhline(v_max, color=ORANGE, linestyle="--",
                            linewidth=0.8, alpha=0.5,
                            label=f"v_max={v_max:.1f}")
-        ax.legend(fontsize=6, facecolor="#3b3b4b",
-                  labelcolor="white", framealpha=0.7)
+        show_legend(ax)
         ax.grid(True, alpha=0.15, color="white")
         ax.tick_params(colors="white", labelsize=6)
 
@@ -472,32 +470,41 @@ class LiveDashboard:
         ax.cla()
         ax.set_facecolor("#2b2b3b")
         ax.set_title("4 — Steering δ", fontsize=9, color="white")
-        ax.set_ylabel("δ (rad)", fontsize=7)
+        ax.set_ylabel("δ_ref (rad)", fontsize=7)
 
         x = []
         delta = []
         xlabel = "Arc length s (m)"
+        label = "δ_ref(s)"
+        break_indices = []
         if d["ref"].get("delta"):
             delta = d["ref"]["delta"]
             if d["ref"].get("t") and len(d["ref"]["t"]) == len(delta):
                 x = d["ref"]["t"]
                 xlabel = "Time t (s)"
+                label = "δ_ref(t)"
+                if len(d["ref"].get("v_ref", [])) == len(delta):
+                    break_indices = stop_break_indices(d["ref"]["v_ref"])
             else:
                 x = path_axis_for_series(d, len(delta))
         elif d["steer"]:
             delta = d["steer"]
             x = path_axis_for_series(d, len(delta))
+            label = "/astar_steering"
 
         ax.set_xlabel(xlabel, fontsize=7)
         if x and delta:
             n = min(len(x), len(delta))
-            ax.plot(x[:n], delta[:n], color=ORANGE, linewidth=1.5,
-                    label="delta_ref")
-            ax.fill_between(x[:n], delta[:n], alpha=0.12, color=ORANGE)
+            x = x[:n]
+            delta = delta[:n]
+            plot_segmented(ax, x, delta, ORANGE, label,
+                           linewidth=1.6, fill_alpha=0.12,
+                           break_indices=break_indices)
+            mark_segment_breaks(ax, x, break_indices)
+            set_padded_ylim(ax, delta, min_span=0.08)
 
         ax.axhline(0.0, color="white", linewidth=0.6, alpha=0.35)
-        ax.legend(fontsize=6, facecolor="#3b3b4b",
-                  labelcolor="white", framealpha=0.7)
+        show_legend(ax)
         ax.grid(True, alpha=0.15, color="white")
         ax.tick_params(colors="white", labelsize=6)
 
@@ -507,32 +514,41 @@ class LiveDashboard:
         ax.cla()
         ax.set_facecolor("#2b2b3b")
         ax.set_title("5 — Acceleration a", fontsize=9, color="white")
-        ax.set_ylabel("a (m/s²)", fontsize=7)
+        ax.set_ylabel("a_ref (m/s²)", fontsize=7)
 
         x = []
         accel = []
         xlabel = "Arc length s (m)"
+        label = "a_ref(s)"
+        break_indices = []
         if d["ref"].get("a"):
             accel = d["ref"]["a"]
             if d["ref"].get("t") and len(d["ref"]["t"]) == len(accel):
                 x = d["ref"]["t"]
                 xlabel = "Time t (s)"
+                label = "a_ref(t)"
+                if len(d["ref"].get("v_ref", [])) == len(accel):
+                    break_indices = stop_break_indices(d["ref"]["v_ref"])
             else:
                 x = path_axis_for_series(d, len(accel))
         elif d["accel"]:
             accel = d["accel"]
             x = path_axis_for_series(d, len(accel))
+            label = "/astar_acceleration"
 
         ax.set_xlabel(xlabel, fontsize=7)
         if x and accel:
             n = min(len(x), len(accel))
-            ax.plot(x[:n], accel[:n], color=GREEN, linewidth=1.5,
-                    label="a_ref")
-            ax.fill_between(x[:n], accel[:n], alpha=0.12, color=GREEN)
+            x = x[:n]
+            accel = accel[:n]
+            plot_segmented(ax, x, accel, GREEN, label,
+                           linewidth=1.6, fill_alpha=0.12,
+                           break_indices=break_indices)
+            mark_segment_breaks(ax, x, break_indices)
+            set_padded_ylim(ax, accel, min_span=0.2)
 
         ax.axhline(0.0, color="white", linewidth=0.6, alpha=0.35)
-        ax.legend(fontsize=6, facecolor="#3b3b4b",
-                  labelcolor="white", framealpha=0.7)
+        show_legend(ax)
         ax.grid(True, alpha=0.15, color="white")
         ax.tick_params(colors="white", labelsize=6)
 

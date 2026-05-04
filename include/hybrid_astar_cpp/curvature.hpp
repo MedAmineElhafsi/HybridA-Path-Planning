@@ -21,7 +21,7 @@ std::vector<Pose2D> resampleUniformArcLength(const std::vector<Pose2D>& path,
 // Professor's curvature pipeline:
 // B-spline smoothed path -> cubic spline fit x(s), y(s) -> analytic spline
 // derivatives -> derivative curvature kappa(s) -> Savitzky-Golay filtering ->
-// curvature-rate limiting.
+// curvature-rate limiting -> short zero-phase arc-length smoothing.
 CurvatureProfile computeProfile(const std::vector<Pose2D>& path,
                                 double target_ds = 0.05,
                                 int filter_window = 5,

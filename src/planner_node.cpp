@@ -303,7 +303,7 @@ PlannerNode::PlannerNode() : Node("hybrid_astar_cpp_node") {
     this->declare_parameter("curvature_filter_window",     9);
     this->declare_parameter("curvature_rate_limit",        0.06);
     this->declare_parameter("steering_rate_limit",         0.35);
-    this->declare_parameter("acceleration_filter_window",  7);
+    this->declare_parameter("acceleration_filter_window",  11);
     this->declare_parameter("terminal_safety_extra_margin", 0.05);
     this->declare_parameter("terminal_goal_pullback_step", 0.10);
     this->declare_parameter("terminal_goal_pullback_max_distance", 1.5);
@@ -315,7 +315,7 @@ PlannerNode::PlannerNode() : Node("hybrid_astar_cpp_node") {
     this->declare_parameter("vel_max_reverse",  0.5);   // max reverse speed (m/s)
     this->declare_parameter("vel_accel_max",    1.0);   // max acceleration (m/s²)
     this->declare_parameter("vel_decel_max",    1.5);   // max deceleration (m/s²)
-    this->declare_parameter("vel_jerk_max",     2.0);   // max jerk for S-curve smoothing (m/s³)
+    this->declare_parameter("vel_jerk_max",     1.2);   // max jerk for S-curve smoothing (m/s³)
     this->declare_parameter("vel_lat_accel_max",1.5);   // lateral accel budget (m/s²)
     this->declare_parameter("vel_min_curv",     0.1);   // min speed on tight curves (m/s)
     

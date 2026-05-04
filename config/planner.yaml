@@ -110,7 +110,8 @@ planner_node:
     # Reference trajectory / curvature kappa(s)
     #   Professor-style derivative curvature:
     #     B-spline path -> cubic spline fit x(s), y(s) -> analytic derivatives
-    #     -> Savitzky-Golay filtering -> bounded dκ/ds.
+    #     -> Savitzky-Golay filtering -> bounded dκ/ds -> short arc-length
+    #        low-pass smoothing for rounded κ(s) and δ(t) transitions.
     #   Curvature remains signed: + left turn, - right turn, 0 straight.
     # -------------------------------------------------------------------------
     trajectory_resample_ds:      0.05   # target spacing for published reference knots (m)
@@ -118,7 +119,7 @@ planner_node:
     curvature_filter_window:     9      # odd moving-average window; still local
     curvature_rate_limit:        0.06   # max |dκ/ds| (1/m²), smooths vertical jumps
     steering_rate_limit:         0.35   # max |dδ/dt| (rad/s), smooths feedforward steering
-    acceleration_filter_window:  7      # odd window for final a(t) smoothing
+    acceleration_filter_window:  11     # odd window for final a(t) smoothing
 
     # -------------------------------------------------------------------------
     # Velocity profile
@@ -132,7 +133,7 @@ planner_node:
     vel_max_reverse:   1.5    # max reverse speed (m/s)  ~ 5.4 km/h
     vel_accel_max:     1.5    # max longitudinal acceleration (m/s²)
     vel_decel_max:     2.5    # max longitudinal deceleration (m/s²)
-    vel_jerk_max:      2.0    # jerk limit for S-curve-like v_ref smoothing (m/s³)
+    vel_jerk_max:      1.2    # jerk limit for softer S-curve-like v_ref smoothing (m/s³)
     vel_lat_accel_max: 2.0    # lateral acceleration budget (m/s²)
     vel_min_curv:      0.5    # floor speed on tight curves (m/s)
 

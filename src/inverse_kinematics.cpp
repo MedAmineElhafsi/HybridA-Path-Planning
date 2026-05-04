@@ -172,8 +172,56 @@ void smoothAccelerations(std::vector<WaypointKinematics>& result,
         }
     }
 
+    // Final zero-phase time low-pass for presentation-quality a_ref(t).
+    // The moving average and jerk limiter remove spikes; this pass rounds the
+    // remaining corners while keeping acceleration exactly zero at endpoints
+    // and direction-change cusps.
+    const double time_constant = std::clamp(0.04 * static_cast<double>(window),
+                                           0.25, 0.60);
+    std::vector<double> rounded = filtered;
+    size_t run_start = 0;
+    while (run_start < n) {
+        size_t run_end = run_start;
+        while (run_end + 1 < n &&
+               path[run_end + 1].direction == path[run_start].direction) {
+            ++run_end;
+        }
+
+        if (run_end <= run_start + 1) {
+            run_start = run_end + 1;
+            continue;
+        }
+
+        std::vector<double> forward(run_end - run_start + 1, 0.0);
+        forward.front() = 0.0;
+        for (size_t i = run_start + 1; i <= run_end; ++i) {
+            const double alpha = dt[i] / (time_constant + dt[i]);
+            const double target = accelerationLocked(path, i) ? 0.0 : filtered[i];
+            const size_t local_i = i - run_start;
+            forward[local_i] = forward[local_i - 1] +
+                alpha * (target - forward[local_i - 1]);
+        }
+
+        std::vector<double> backward(forward.size(), 0.0);
+        backward.back() = 0.0;
+        for (size_t i = run_end; i > run_start; --i) {
+            const double alpha = dt[i] / (time_constant + dt[i]);
+            const size_t local_i = i - run_start;
+            backward[local_i - 1] = backward[local_i] +
+                alpha * (forward[local_i - 1] - backward[local_i]);
+        }
+
+        for (size_t i = run_start; i <= run_end; ++i) {
+            rounded[i] = accelerationLocked(path, i) ? 0.0 : backward[i - run_start];
+        }
+        rounded[run_start] = 0.0;
+        rounded[run_end] = 0.0;
+
+        run_start = run_end + 1;
+    }
+
     for (size_t i = 0; i < n; ++i) {
-        result[i].acceleration = accelerationLocked(path, i) ? 0.0 : filtered[i];
+        result[i].acceleration = accelerationLocked(path, i) ? 0.0 : rounded[i];
     }
 }
 
@@ -201,8 +249,8 @@ std::vector<WaypointKinematics> InverseKinematics::compute(
     // Pass 1: curvature + Ackermann wheel angles.
     //
     // Curvature follows the professor's kappa(s) sketch:
-    //   smoothed path -> uniform arc-length resampling -> central-difference
-    //   derivative curvature -> light moving-average filtering.
+    //   smoothed path -> uniform arc-length resampling -> cubic spline
+    //   derivatives -> filtered/rate-limited curvature.
     //
     // The helper splits at forward/reverse direction changes, so derivatives
     // and filtering never cross cusps.  Positive curvature is a left turn,

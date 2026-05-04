@@ -32,7 +32,7 @@ public:
         double v_max_reverse  = 0.5;   // max reverse speed (m/s)
         double a_max          = 1.0;   // max longitudinal acceleration (m/s²)
         double d_max          = 1.5;   // max longitudinal deceleration (m/s²)
-        double j_max          = 2.0;   // max longitudinal jerk for S-curve smoothing (m/s³)
+        double j_max          = 1.2;   // max longitudinal jerk for S-curve smoothing (m/s³)
         double a_lat_max      = 1.5;   // max lateral acceleration (m/s²) — governs curvature limit
         double v_min_curv     = 0.1;   // floor speed used when curvature is near-zero (m/s)
     };

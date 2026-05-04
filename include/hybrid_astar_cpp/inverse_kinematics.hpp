@@ -56,8 +56,8 @@ public:
         int curvature_filter_window = 5,
         double curvature_rate_limit = 0.06,
         double steering_rate_limit = 0.35,
-        int acceleration_filter_window = 7,
-        double acceleration_jerk_limit = 2.0);
+        int acceleration_filter_window = 11,
+        double acceleration_jerk_limit = 1.2);
 };
 
 #endif  // HYBRID_ASTAR_CPP_INVERSE_KINEMATICS_HPP_

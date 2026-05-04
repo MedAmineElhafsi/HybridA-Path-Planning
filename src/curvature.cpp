@@ -305,6 +305,82 @@ void limitCurvatureRateByArcLength(const std::vector<Pose2D>& samples,
     }
 }
 
+void applyZeroPhaseCurvatureLowPass(const std::vector<Pose2D>& samples,
+                                    const std::vector<double>& s,
+                                    std::vector<double>& kappa,
+                                    double smoothing_length) {
+    if (samples.size() < 3 || samples.size() != s.size() ||
+        samples.size() != kappa.size() || smoothing_length <= kEps) {
+        return;
+    }
+
+    std::vector<double> filtered = kappa;
+
+    size_t run_start = 0;
+    while (run_start < samples.size()) {
+        size_t run_end = run_start;
+        while (run_end + 1 < samples.size() &&
+               samples[run_end + 1].direction == samples[run_start].direction) {
+            ++run_end;
+        }
+
+        if (run_end <= run_start + 1) {
+            run_start = run_end + 1;
+            continue;
+        }
+
+        std::vector<double> forward(run_end - run_start + 1, 0.0);
+        forward.front() = 0.0;
+        for (size_t i = run_start + 1; i <= run_end; ++i) {
+            const double ds = std::max(0.0, s[i] - s[i - 1]);
+            const double alpha = ds / (smoothing_length + ds);
+            const size_t local_i = i - run_start;
+            forward[local_i] = forward[local_i - 1] +
+                alpha * (kappa[i] - forward[local_i - 1]);
+        }
+
+        std::vector<double> backward(forward.size(), 0.0);
+        backward.back() = 0.0;
+        for (size_t i = run_end; i > run_start; --i) {
+            const double ds = std::max(0.0, s[i] - s[i - 1]);
+            const double alpha = ds / (smoothing_length + ds);
+            const size_t local_i = i - run_start;
+            backward[local_i - 1] = backward[local_i] +
+                alpha * (forward[local_i - 1] - backward[local_i]);
+        }
+
+        for (size_t i = run_start; i <= run_end; ++i) {
+            filtered[i] = backward[i - run_start];
+        }
+        filtered[run_start] = 0.0;
+        filtered[run_end] = 0.0;
+
+        run_start = run_end + 1;
+    }
+
+    kappa = std::move(filtered);
+}
+
+void applySoftCurvatureDeadband(std::vector<double>& kappa,
+                                double deadband,
+                                double full_scale) {
+    if (deadband <= 0.0 || full_scale <= deadband) return;
+
+    for (double& value : kappa) {
+        const double mag = std::abs(value);
+        if (mag <= deadband) {
+            value = 0.0;
+            continue;
+        }
+        if (mag >= full_scale) continue;
+
+        const double x = std::clamp(
+            (mag - deadband) / (full_scale - deadband), 0.0, 1.0);
+        const double smooth = x * x * (3.0 - 2.0 * x);
+        value *= smooth;
+    }
+}
+
 }  // namespace
 
 namespace PathCurvature {
@@ -459,6 +535,15 @@ CurvatureProfile computeProfile(const std::vector<Pose2D>& path,
     applySavitzkyGolay(samples, profile.kappa, filter_window);
     limitCurvatureRateByArcLength(
         samples, profile.s, profile.kappa, max_curvature_rate);
+    // The hard rate limiter bounds |dκ/ds| but can leave straight ramp corners.
+    // A short forward/backward arc-length low-pass rounds those corners without
+    // crossing cusps, making the published κ(s) and δ(t)=atan(Lκ) look like a
+    // professor-style smooth reference trajectory rather than a debug signal.
+    const double smoothing_length = std::clamp(
+        normalizedWindow(filter_window) * ds * 3.5, 0.35, 1.10);
+    applyZeroPhaseCurvatureLowPass(
+        samples, profile.s, profile.kappa, smoothing_length);
+    applySoftCurvatureDeadband(profile.kappa, 0.0025, 0.012);
 
     return profile;
 }
