@@ -1,0 +1,23 @@
+# Colcon / ROS 2 build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# VSCode IntelliSense database (regenerated locally)
+.vscode/browse.vc.db
+.vscode/browse.vc.db-shm
+.vscode/browse.vc.db-wal
+.vscode/ipch/
+
+# Claude / Codex local state
+.claude/
+.codex
+
+# OS / editor cruft
+.DS_Store
+*.swp

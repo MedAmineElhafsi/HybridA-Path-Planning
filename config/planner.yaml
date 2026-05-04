@@ -1,0 +1,215 @@
+# =============================================================================
+# Hybrid A* Planner — Real Vehicle Configuration (Sedan, e.g. Toyota Camry)
+# =============================================================================
+#
+# COLLISION MARGIN STACK (how the safety bubble is built):
+#
+#   car footprint  = car_length x car_width                  (4.5 x 1.8 m)
+#   plan_margin    = +0.15 m each side  →  hard collision box (4.8 x 2.1 m)
+#   hard_obstacle_margin = +0.05 m extra binary inflation
+#   soft_obstacle_margin = +0.30 m drives the clearance COST (not a hard wall)
+#
+#   desired_clearance = (car_width/2) + plan_margin + hard_margin + soft_margin
+#                     = 0.90 + 0.15 + 0.05 + 0.30 = 1.40 m from center-line
+#
+#   smoother_obstacle_threshold = 1.8 m (= car_width)
+#     → smoother starts pushing the path away once it is within 1.8 m of
+#       the nearest obstacle surface, well before the hard collision box.
+# =============================================================================
+
+planner_node:
+  ros__parameters:
+
+    # -------------------------------------------------------------------------
+    # Frame & map
+    # -------------------------------------------------------------------------
+    map_frame: "map"
+    xy_resolution: 0.25         # grid cell size (m) — fine enough for 1.8 m wide car
+
+    # -------------------------------------------------------------------------
+    # Vehicle geometry
+    # -------------------------------------------------------------------------
+    car_length:        4.5     # bumper-to-bumper (m)
+    car_width:         1.8     # mirror-to-mirror (m)
+    car_track_width:   1.58    # left-to-right wheel contact patch spacing (m)
+    planner_wheelbase: 2.7     # front-to-rear axle (m)
+    min_turning_radius: 5.5    # at full steering lock (m)
+
+    # -------------------------------------------------------------------------
+    # Collision margins  (see stack explanation at top)
+    # -------------------------------------------------------------------------
+    plan_margin:              0.15   # hard footprint inflation each side (m)
+    hard_obstacle_margin:     0.05   # extra binary inflation on top (m)
+    soft_obstacle_margin:     0.30   # clearance cost zone beyond hard box (m)
+    obstacle_clearance_weight: 0.75  # cost multiplier inside soft zone
+    clearance_relaxation_radius: 2.5 # relax clearance cost within 2.5 m of
+                                     # start/goal so tight terminal maneuvers
+                                     # remain feasible
+
+    # -------------------------------------------------------------------------
+    # Planner search
+    # -------------------------------------------------------------------------
+    planner_step_size:     0.25   # smaller primitives reduce terminal wiggles
+    steer_samples:         11     # denser steering lattice for cleaner parking maneuvers
+    goal_pos_thresh:       0.40   # accept goal if within 40 cm (m)
+    goal_yaw_thresh:       0.15   # accept goal if within ~8.6° (rad)
+    analytic_every_n:      10     # attempt Dubins/RS shot every N expansions
+    analytic_radius:       12.0   # only attempt analytic shot within 12 m of goal
+    analytic_endpoint_tol: 0.50   # analytic path must land within 50 cm of goal
+    final_snap_pos:        0.35   # snap last pose to exact goal if within 35 cm
+    final_snap_yaw:        0.35   # snap last yaw to exact goal if within 20°
+    detour_ratio:          3.0    # reject analytic shot if > 3× straight-line dist
+
+    # Motion penalties
+    #   penalty_reverse: 0.5 means each reverse metre costs 1.5× a forward metre.
+    #   Applied to both grid expansions AND analytic (RS) shots so the planner
+    #   never gets reverse arcs for free.
+    #   Raise toward 1.0 for a strong forward-only preference.
+    #   Raise toward 2.0+ to almost completely forbid reversing.
+    penalty_reverse:       0.15   # allow backing up when it is the natural maneuver
+    penalty_steer:         0.005  # small cost per radian of steering angle
+    penalty_steer_change:  0.04   # cost per radian of steering change (smoothness)
+    penalty_direction_change: 0.75 # discourage forward/reverse shuffle near the goal
+
+    # -------------------------------------------------------------------------
+    # Terminal maneuver safety
+    # -------------------------------------------------------------------------
+    terminal_safety_extra_margin:      0.08   # extra margin at goal only (m)
+    terminal_goal_pullback_step:       0.15   # pullback step size (m)
+    terminal_goal_pullback_max_distance: 2.0  # max pullback from requested goal (m)
+    chain_start_min_backtrack:         2.5    # min backtrack on next plan chain (m)
+    chain_start_clearance_padding:     0.05
+
+    # -------------------------------------------------------------------------
+    # Footprint display in RViz
+    # -------------------------------------------------------------------------
+    footprint_display_margin: 0.0   # extra visual margin (m) — 0 = exact footprint
+    footprint_spacing:        1.2   # publish one footprint marker every 1.2 m
+
+    # -------------------------------------------------------------------------
+    # Live odometry replanning (disabled by default — set true for live robot)
+    # -------------------------------------------------------------------------
+    use_live_start_from_odom:    false
+    live_start_topic:            "/odom"
+    odom_replan_min_translation: 0.30
+    odom_replan_min_yaw:         0.20
+    odom_replan_min_interval_s:  0.8
+
+    # -------------------------------------------------------------------------
+    # Path smoother — cubic B-spline
+    #   Blends each interior waypoint toward a uniform cubic B-spline fit.
+    #   Result is C2-continuous (smooth curvature) — required for MPC.
+    #   blend: 0.0 = no change, 1.0 = pure spline
+    # -------------------------------------------------------------------------
+    smoother_bspline_blend:      0.35   # stay visibly closer to the raw Hybrid A* path
+    smoother_max_point_shift:    0.12   # max lateral move per waypoint (m); 0 disables cap
+    smoother_goal_lock_distance: 2.5    # lock the last 2.5 m near goal (m)
+    smoother_cusp_guard_points:  3      # lock N waypoints either side of cusps
+
+    # -------------------------------------------------------------------------
+    # Velocity profile
+    #   v_max       = 4.0 m/s (~14.4 km/h) — normal parking lot / slow urban
+    #   a_lat_max   = 2.0 m/s² — comfortable cornering (ISO 2631 limit is 2.5)
+    #   On a 5.5 m turn radius: v_curv = sqrt(2.0*5.5) = 3.32 m/s
+    #   → curvature caps speed to 3.32 m/s at full steering lock, vel_max
+    #     (4.0 m/s) is only reached on straight or gently curved segments.
+    # -------------------------------------------------------------------------
+    vel_max:           4.0    # max forward speed (m/s)  ~14.4 km/h
+    vel_max_reverse:   1.5    # max reverse speed (m/s)  ~ 5.4 km/h
+    vel_accel_max:     1.5    # max longitudinal acceleration (m/s²)
+    vel_decel_max:     2.5    # max longitudinal deceleration (m/s²)
+    vel_lat_accel_max: 2.0    # lateral acceleration budget (m/s²)
+    vel_min_curv:      0.5    # floor speed on tight curves (m/s)
+
+
+# =============================================================================
+# Linear MPC controller
+# -----------------------------------------------------------------------------
+#   Tracks the planner output (path + velocity profile + Ackermann IK).
+#   Horizon = N · dt = 20 · 0.1 s = 2.0 s lookahead.
+# =============================================================================
+mpc_controller_node:
+  ros__parameters:
+    control_rate_hz: 20.0        # MPC tick frequency
+    mpc_horizon_N:   20          # prediction horizon length (steps)
+    mpc_dt:          0.1         # MPC time step (s)
+    wheelbase:       2.7         # must match planner_wheelbase
+
+    # State-tracking weights  Q = diag(q_x, q_y, q_yaw, q_v)
+    q_x:   5.0
+    q_y:   5.0
+    q_yaw: 3.0
+    q_v:   1.0
+
+    # Input-effort weights    R = diag(r_a, r_delta)
+    r_a:      0.1
+    r_delta:  1.0
+
+    # Terminal weights        P = diag(p_x, p_y, p_yaw, p_v)
+    #   Rule of thumb: P ~ 10·Q for tracking stability.
+    p_x:   50.0
+    p_y:   50.0
+    p_yaw: 10.0
+    p_v:   5.0
+
+    # Input box constraints (absolute — applied on u, not on δu)
+    a_min:    -3.0               # max braking  (m/s²)
+    a_max:     2.0               # max acceleration
+    delta_min: -0.6              # ~ −34° steering
+    delta_max:  0.6
+
+    # FISTA solver
+    fista_max_iter: 200
+    fista_tol:      1.0e-4
+
+    odom_topic: "/odom"
+    cmd_topic:  "/mpc_cmd"
+
+# =============================================================================
+# Ackermann kinematic simulator (closes the loop with the MPC for testing)
+# =============================================================================
+kinematic_simulator:
+  ros__parameters:
+    wheelbase:          2.7
+    integrate_rate_hz:  100.0
+    publish_rate_hz:    50.0
+    odom_frame:         "map"
+    base_frame:         "base_link"
+    cmd_topic:          "/mpc_cmd"
+    a_min:    -5.0
+    a_max:     3.0
+    delta_min: -0.6
+    delta_max:  0.6
+    v_max:     10.0
+    v_min:     -5.0
+
+# =============================================================================
+# Animated vehicle visualizer
+# Proportions scaled to match the real sedan above (4.5 x 1.8 m body)
+# =============================================================================
+path_vehicle_visualizer:
+  ros__parameters:
+    path_topic:   "/astar_path"
+    marker_topic: "/astar_vehicle"
+
+    animation_speed:  4.0      # matches vel_max (m/s)
+    update_rate_hz:   30.0
+
+    # Body box
+    vehicle_length: 4.5
+    vehicle_width:  1.8
+    vehicle_height: 1.50       # typical sedan roof height above ground
+
+    # Cabin (greenhouse / glass area)
+    cabin_length:         2.10
+    cabin_width:          1.65
+    cabin_height:         0.80
+    cabin_forward_offset: 0.30  # cabin shifted slightly forward of center
+
+    # Headlights
+    headlight_spacing: 1.40    # distance between left & right lights (m)
+    headlight_radius:  0.12    # sphere radius (m)
+
+    # Light beam cone
+    light_beam_length: 8.0     # how far the cone reaches ahead (m)
+    light_beam_width:  3.5     # cone width at the tip (m)
