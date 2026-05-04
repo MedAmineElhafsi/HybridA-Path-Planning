@@ -47,6 +47,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr steering_left_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr steering_right_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr acceleration_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr reference_trajectory_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr footprint_pub_;
 
     std::mutex state_mutex_;

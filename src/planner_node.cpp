@@ -1,4 +1,6 @@
 #include "hybrid_astar_cpp/planner_node.hpp"
+#include "hybrid_astar_cpp/curvature.hpp"
+#include "hybrid_astar_cpp/reference_trajectory.hpp"
 
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <tf2/utils.h>
@@ -7,6 +9,7 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <utility>
 
 namespace {
 double wrapAngle(double angle) {
@@ -295,6 +298,12 @@ PlannerNode::PlannerNode() : Node("hybrid_astar_cpp_node") {
     this->declare_parameter("smoother_max_point_shift",    0.0);
     this->declare_parameter("smoother_goal_lock_distance", 2.5);
     this->declare_parameter("smoother_cusp_guard_points",  3);
+    this->declare_parameter("trajectory_resample_ds",      0.05);
+    this->declare_parameter("curvature_resample_ds",       0.025);
+    this->declare_parameter("curvature_filter_window",     9);
+    this->declare_parameter("curvature_rate_limit",        0.06);
+    this->declare_parameter("steering_rate_limit",         0.35);
+    this->declare_parameter("acceleration_filter_window",  7);
     this->declare_parameter("terminal_safety_extra_margin", 0.05);
     this->declare_parameter("terminal_goal_pullback_step", 0.10);
     this->declare_parameter("terminal_goal_pullback_max_distance", 1.5);
@@ -306,6 +315,7 @@ PlannerNode::PlannerNode() : Node("hybrid_astar_cpp_node") {
     this->declare_parameter("vel_max_reverse",  0.5);   // max reverse speed (m/s)
     this->declare_parameter("vel_accel_max",    1.0);   // max acceleration (m/s²)
     this->declare_parameter("vel_decel_max",    1.5);   // max deceleration (m/s²)
+    this->declare_parameter("vel_jerk_max",     2.0);   // max jerk for S-curve smoothing (m/s³)
     this->declare_parameter("vel_lat_accel_max",1.5);   // lateral accel budget (m/s²)
     this->declare_parameter("vel_min_curv",     0.1);   // min speed on tight curves (m/s)
     
@@ -326,6 +336,8 @@ PlannerNode::PlannerNode() : Node("hybrid_astar_cpp_node") {
     steering_left_pub_  = this->create_publisher<std_msgs::msg::Float64MultiArray>("astar_steering_left", 10);
     steering_right_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("astar_steering_right", 10);
     acceleration_pub_   = this->create_publisher<std_msgs::msg::Float64MultiArray>("astar_acceleration", 10);
+    reference_trajectory_pub_ =
+        this->create_publisher<std_msgs::msg::Float64MultiArray>("astar_reference_trajectory", 10);
     footprint_pub_      = this->create_publisher<visualization_msgs::msg::MarkerArray>("astar_footprints", 10);
 
     // 3. Setup Subscribers
@@ -502,6 +514,20 @@ void PlannerNode::planPath() {
         0.0, this->get_parameter("smoother_goal_lock_distance").as_double());
     int smoother_cusp_guard_points = std::max(
         0, static_cast<int>(this->get_parameter("smoother_cusp_guard_points").as_int()));
+    const double trajectory_resample_ds = std::max(
+        0.01, this->get_parameter("trajectory_resample_ds").as_double());
+    const double curvature_resample_ds = std::max(
+        0.01, this->get_parameter("curvature_resample_ds").as_double());
+    const int curvature_filter_window = std::max(
+        1, static_cast<int>(this->get_parameter("curvature_filter_window").as_int()));
+    const double curvature_rate_limit = std::max(
+        0.0, this->get_parameter("curvature_rate_limit").as_double());
+    const double steering_rate_limit = std::max(
+        0.0, this->get_parameter("steering_rate_limit").as_double());
+    const int acceleration_filter_window = std::max(
+        1, static_cast<int>(this->get_parameter("acceleration_filter_window").as_int()));
+    const double vel_jerk_max = std::max(
+        0.01, this->get_parameter("vel_jerk_max").as_double());
     double chain_start_min_backtrack = std::max(
         0.0, this->get_parameter("chain_start_min_backtrack").as_double());
     double chain_start_clearance_padding = std::max(
@@ -685,7 +711,10 @@ void PlannerNode::planPath() {
         raw_path_pub_->publish(raw_msg);
     }
 
-    // 5b. Smooth the path with cubic B-spline.
+    // 5b. Smooth the path with cubic B-spline, then resample it uniformly by
+    // arc length.  This is the trajectory-generation front half in the
+    // professor sketch:
+    //   Hybrid A* path -> trajectory smoothing -> uniform reference knots.
     if (success && !final_path.empty()) {
         PathSmoother smoother(smoother_goal_lock_distance, smoother_cusp_guard_points);
         smoother.smoothPath(
@@ -693,25 +722,57 @@ void PlannerNode::planPath() {
             collision_checker_,
             smoother_bspline_blend,
             smoother_max_point_shift);
+
+        std::vector<Pose2D> resampled_path =
+            PathCurvature::resampleUniformArcLength(final_path, trajectory_resample_ds);
+        if (!resampled_path.empty()) {
+            final_path = std::move(resampled_path);
+        }
     }
 
-    // 6. Compute velocity profile
+    // 6. Compute velocity profile on the resampled reference knots.
     if (success && !final_path.empty()) {
         VelocityProfiler::Params vp;
         vp.v_max         = std::max(0.01, this->get_parameter("vel_max").as_double());
         vp.v_max_reverse = std::max(0.01, this->get_parameter("vel_max_reverse").as_double());
         vp.a_max         = std::max(0.01, this->get_parameter("vel_accel_max").as_double());
         vp.d_max         = std::max(0.01, this->get_parameter("vel_decel_max").as_double());
+        vp.j_max         = vel_jerk_max;
         vp.a_lat_max     = std::max(0.01, this->get_parameter("vel_lat_accel_max").as_double());
         vp.v_min_curv    = std::max(0.01, this->get_parameter("vel_min_curv").as_double());
-        VelocityProfiler::compute(final_path, vp);
+        VelocityProfiler::compute(
+            final_path,
+            vp,
+            1e-4,
+            curvature_resample_ds,
+            curvature_filter_window,
+            curvature_rate_limit);
     }
 
-    // 7. Compute Ackermann inverse kinematics (κ, δ_avg, δ_left, δ_right, a)
+    // 7. Compute inverse kinematics on the same knots:
+    //    derivative kappa(s), Ackermann steering delta, and acceleration.
     const double car_track_width = std::max(0.01, this->get_parameter("car_track_width").as_double());
     std::vector<WaypointKinematics> ik_result;
     if (success && !final_path.empty()) {
-        ik_result = InverseKinematics::compute(final_path, planner_wheelbase, car_track_width);
+        ik_result = InverseKinematics::compute(
+            final_path,
+            planner_wheelbase,
+            car_track_width,
+            curvature_resample_ds,
+            curvature_filter_window,
+            curvature_rate_limit,
+            steering_rate_limit,
+            acceleration_filter_window,
+            vel_jerk_max);
+    }
+
+    // 8. Assemble the explicit professor-style reference trajectory:
+    //    <x, y, yaw/phi, v_ref, t, kappa, delta, a>.
+    //    The MPC consumes the legacy aligned topics below; conceptually it is
+    //    the vehicle model/controller block that follows this reference.
+    std::vector<ReferenceTrajectory::Point> reference_trajectory;
+    if (success && !final_path.empty()) {
+        reference_trajectory = ReferenceTrajectory::assemble(final_path, ik_result);
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -847,6 +908,8 @@ void PlannerNode::planPath() {
     velocity_pub_->publish(vel_msg);
 
     // Publish Ackermann inverse kinematics.
+    // /astar_curvature uses the professor's derivative kappa(s) formula on the
+    // B-spline smoothed path after uniform arc-length resampling and filtering.
     // Every array is index-aligned with path_msg.poses and astar_velocity_profile.
     std_msgs::msg::Float64MultiArray curv_msg, steer_avg_msg, steer_left_msg, steer_right_msg, accel_msg;
     curv_msg.data.reserve(ik_result.size());
@@ -867,6 +930,11 @@ void PlannerNode::planPath() {
     steering_right_pub_->publish(steer_right_msg);
     acceleration_pub_->publish(accel_msg);
 
+    // Clear, row-major reference trajectory topic:
+    // [x, y, yaw, v_ref, t, kappa, delta, a] for every /astar_path pose.
+    reference_trajectory_pub_->publish(
+        ReferenceTrajectory::toMessage(reference_trajectory));
+
     path_pub_->publish(path_msg);
     footprint_pub_->publish(marker_array);
 }
@@ -879,6 +947,7 @@ void PlannerNode::publishResetVisualization(
     path_msg.header.stamp = this->now();
     path_msg.header.frame_id = frame_id.empty() ? map_frame_ : frame_id;
     path_pub_->publish(path_msg);
+    reference_trajectory_pub_->publish(ReferenceTrajectory::toMessage({}));
 
     visualization_msgs::msg::MarkerArray marker_array;
     appendPoseMarker(marker_array, path_msg.header, start_pose, 1000, 0.10f, 0.82f, 1.0f, "START");

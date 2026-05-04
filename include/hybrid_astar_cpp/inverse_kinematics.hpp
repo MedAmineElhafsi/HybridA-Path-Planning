@@ -29,7 +29,7 @@
 //
 // When κ → 0 (straight line): δ_avg = δ_left = δ_right = 0.
 struct WaypointKinematics {
-    double curvature       = 0.0;   // κ       (rad/m)   signed Menger curvature
+    double curvature       = 0.0;   // κ       (rad/m)   signed derivative curvature
     double delta_avg       = 0.0;   // δ_avg   (rad)     bicycle-equivalent front steering
     double delta_left      = 0.0;   // δ_left  (rad)     left  front-wheel steering angle
     double delta_right     = 0.0;   // δ_right (rad)     right front-wheel steering angle
@@ -37,7 +37,10 @@ struct WaypointKinematics {
 };
 
 // Computes Ackermann inverse kinematics for every waypoint in a smoothed,
-// velocity-profiled path.
+// velocity-profiled path.  Curvature is computed with the professor's kappa(s)
+// derivative formula after uniform arc-length resampling, light filtering and
+// curvature-rate limiting.  Steering and acceleration are also rate-smoothed so
+// the reference trajectory is easier for a real vehicle/controller to follow.
 //
 // Parameters:
 //   path       — planned + smoothed + velocity-profiled path (Pose2D::velocity filled)
@@ -48,7 +51,13 @@ public:
     static std::vector<WaypointKinematics> compute(
         const std::vector<Pose2D>& path,
         double wheelbase,
-        double track_width);
+        double track_width,
+        double curvature_resample_ds = 0.05,
+        int curvature_filter_window = 5,
+        double curvature_rate_limit = 0.06,
+        double steering_rate_limit = 0.35,
+        int acceleration_filter_window = 7,
+        double acceleration_jerk_limit = 2.0);
 };
 
 #endif  // HYBRID_ASTAR_CPP_INVERSE_KINEMATICS_HPP_

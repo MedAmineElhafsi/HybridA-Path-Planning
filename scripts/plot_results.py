@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 """Live real-time thesis dashboard — updates while the car is moving.
 
-Layout (single window, 3×3 grid):
-  ┌──────────────┬──────────────┬──────────────┐
-  │              │              │  e_lat (m)   │
-  │  Plot 1      │  Plot 4      ├──────────────┤
-  │  Path        │  Tracking    │  e_yaw (°)   │
-  │  Planning    │  (live)      ├──────────────┤
-  │              │              │  e_v  (m/s)  │
-  ├──────────────┼──────────────┤              │
-  │  Plot 2      │  Plot 3      │  Plot 5      │
-  │  Curvature   │  Velocity    │  (errors)    │
-  └──────────────┴──────────────┴──────────────┘
+Plots the professor-style reference trajectory assembled by the planner:
+path geometry, kappa(s), v_ref(t), steering delta(t), and acceleration a(t).
 
 Usage:
     ros2 run hybrid_astar_cpp plot_results.py
@@ -33,19 +24,12 @@ from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid, Path, Odometry
 from std_msgs.msg import Float64MultiArray
 
+REFERENCE_FIELDS = ("x", "y", "yaw", "v_ref", "t", "kappa", "delta", "a")
+
 
 # ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
-def menger_curvature(p0, p1, p2):
-    ax, ay = p1[0]-p0[0], p1[1]-p0[1]
-    bx, by = p2[0]-p1[0], p2[1]-p1[1]
-    cx, cy = p2[0]-p0[0], p2[1]-p0[1]
-    cross  = ax*by - ay*bx
-    a, b, c = math.hypot(ax,ay), math.hypot(bx,by), math.hypot(cx,cy)
-    denom = a*b*c
-    return 2.0*abs(cross)/denom if denom > 1e-12 else 0.0
-
 def arc_lengths(pts):
     s = [0.0]
     for i in range(1, len(pts)):
@@ -53,15 +37,130 @@ def arc_lengths(pts):
                                      pts[i][1]-pts[i-1][1]))
     return s
 
-def curvatures_from_path(pts):
-    n = len(pts)
+def resample_uniform_arclength(pts, target_ds=0.05):
+    """Return (s, xy) resampled at near-constant arc-length spacing."""
+    if len(pts) < 2:
+        return [0.0]*len(pts), list(pts)
+
+    s_src = arc_lengths(pts)
+    length = s_src[-1]
+    if length <= 1e-9:
+        return [0.0], [pts[0]]
+
+    intervals = max(1, int(math.ceil(length / max(target_ds, 0.01))))
+    ds = length / intervals
+    out_s = [i*ds for i in range(intervals)]
+    out_s.append(length)
+
+    out_pts = []
+    src_i = 1
+    for target_s in out_s:
+        while src_i < len(s_src)-1 and s_src[src_i] < target_s:
+            src_i += 1
+
+        lo = max(0, src_i-1)
+        hi = src_i
+        denom = s_src[hi] - s_src[lo]
+        if denom <= 1e-9:
+            out_pts.append(pts[hi])
+            continue
+
+        t = min(1.0, max(0.0, (target_s - s_src[lo]) / denom))
+        x = pts[lo][0] + t*(pts[hi][0] - pts[lo][0])
+        y = pts[lo][1] + t*(pts[hi][1] - pts[lo][1])
+        out_pts.append((x, y))
+
+    return out_s, out_pts
+
+def moving_average(values, window=5):
+    window = max(1, int(window))
+    if window % 2 == 0:
+        window += 1
+    if window <= 1 or len(values) < 3:
+        return list(values)
+
+    half = window // 2
+    filtered = [0.0]*len(values)
+    for i in range(len(values)):
+        if i == 0 or i == len(values)-1:
+            continue
+        lo = max(1, i-half)
+        hi = min(len(values)-2, i+half)
+        filtered[i] = sum(values[lo:hi+1]) / (hi-lo+1)
+    return filtered
+
+def derivative_curvature_profile(pts, target_ds=0.05, filter_window=1):
+    """Signed kappa(s) from x', y', x'', y'' on uniformly resampled points."""
+    s, samples = resample_uniform_arclength(pts, target_ds)
+    n = len(samples)
     k = [0.0]*n
+    if n < 3:
+        return s, k
+
     for i in range(1, n-1):
-        k[i] = menger_curvature(pts[i-1], pts[i], pts[i+1])
-    if n >= 3:
-        k[0]   = menger_curvature(pts[0],   pts[1],   pts[2])
-        k[n-1] = menger_curvature(pts[n-3], pts[n-2], pts[n-1])
-    return k
+        ds_prev = s[i] - s[i-1]
+        ds_next = s[i+1] - s[i]
+        ds = 0.5*(ds_prev + ds_next)
+        if ds <= 1e-9:
+            continue
+
+        x_prime = (samples[i+1][0] - samples[i-1][0]) / (2.0*ds)
+        y_prime = (samples[i+1][1] - samples[i-1][1]) / (2.0*ds)
+        x_second = (samples[i+1][0] - 2.0*samples[i][0] + samples[i-1][0]) / (ds*ds)
+        y_second = (samples[i+1][1] - 2.0*samples[i][1] + samples[i-1][1]) / (ds*ds)
+
+        denom = (x_prime*x_prime + y_prime*y_prime)**1.5
+        if denom > 1e-9:
+            k[i] = (x_prime*y_second - y_prime*x_second) / denom
+
+    return s, moving_average(k, filter_window)
+
+def curvature_topic_axis(pts, curv):
+    if not curv:
+        return [], []
+
+    s_path = arc_lengths(pts)
+    if len(curv) == len(s_path):
+        return s_path, curv
+
+    total = s_path[-1] if s_path else 0.0
+    if len(curv) == 1:
+        return [0.0], curv
+    return list(np.linspace(0.0, total, len(curv))), curv
+
+def reference_from_msg(msg):
+    cols = len(REFERENCE_FIELDS)
+    if msg.layout.dim and len(msg.layout.dim) >= 2 and msg.layout.dim[1].size:
+        cols = int(msg.layout.dim[1].size)
+    if cols < len(REFERENCE_FIELDS) or len(msg.data) < cols:
+        return {name: [] for name in REFERENCE_FIELDS}
+
+    rows = len(msg.data) // cols
+    ref = {name: [] for name in REFERENCE_FIELDS}
+    for r in range(rows):
+        base = r * cols
+        for c, name in enumerate(REFERENCE_FIELDS):
+            ref[name].append(float(msg.data[base + c]))
+    return ref
+
+def reference_xy(ref):
+    if ref and ref.get("x") and ref.get("y"):
+        return list(zip(ref["x"], ref["y"]))
+    return []
+
+def path_axis_for_series(d, series_len):
+    ref_pts = reference_xy(d["ref"])
+    if ref_pts and len(ref_pts) == series_len:
+        return arc_lengths(ref_pts)
+
+    if d["smooth"] and d["smooth"].poses:
+        pts = path_to_xy(d["smooth"])
+        n = min(len(pts), series_len)
+        return arc_lengths(pts[:n])
+
+    if series_len <= 1:
+        return [0.0] * series_len
+    return list(np.arange(series_len, dtype=float))
 
 def path_to_xy(msg):
     return [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
@@ -95,6 +194,9 @@ class DataCollector(Node):
         self.smooth_path_msg = None
         self.velocity_data   = []
         self.curvature_data  = []
+        self.steering_data   = []
+        self.acceleration_data = []
+        self.reference_data  = {name: [] for name in REFERENCE_FIELDS}
 
         # Accumulated per run (reset on new path)
         self.odom_xy   = []          # [(x,y), ...]
@@ -115,6 +217,12 @@ class DataCollector(Node):
                                  self._cb_vel,      10)
         self.create_subscription(Float64MultiArray, "astar_curvature",
                                  self._cb_curv,     10)
+        self.create_subscription(Float64MultiArray, "astar_steering",
+                                 self._cb_steer,    10)
+        self.create_subscription(Float64MultiArray, "astar_acceleration",
+                                 self._cb_accel,    10)
+        self.create_subscription(Float64MultiArray, "astar_reference_trajectory",
+                                 self._cb_reference, 10)
         self.create_subscription(Odometry,          "/odom",
                                  self._cb_odom,     20)
         self.create_subscription(Float64MultiArray, "mpc_tracking_error",
@@ -139,6 +247,15 @@ class DataCollector(Node):
 
     def _cb_curv(self, msg):
         with self.lock: self.curvature_data = list(msg.data)
+
+    def _cb_steer(self, msg):
+        with self.lock: self.steering_data = list(msg.data)
+
+    def _cb_accel(self, msg):
+        with self.lock: self.acceleration_data = list(msg.data)
+
+    def _cb_reference(self, msg):
+        with self.lock: self.reference_data = reference_from_msg(msg)
 
     def _cb_odom(self, msg):
         with self.lock:
@@ -170,6 +287,9 @@ class DataCollector(Node):
                 smooth      = self.smooth_path_msg,
                 vel         = list(self.velocity_data),
                 curv        = list(self.curvature_data),
+                steer       = list(self.steering_data),
+                accel       = list(self.acceleration_data),
+                ref         = {k: list(v) for k, v in self.reference_data.items()},
                 odom        = list(self.odom_xy),
                 err_t       = list(self.err_t),
                 err_lat     = list(self.err_lat),
@@ -191,24 +311,28 @@ class LiveDashboard:
     def __init__(self, node: DataCollector):
         self.node = node
 
-        self.fig = plt.figure(figsize=(19, 10))
+        self.fig = plt.figure(figsize=(19, 11))
         self.fig.patch.set_facecolor("#1e1e2e")
-        plt.suptitle("Hybrid A* + MPC — Live Dashboard",
+        plt.suptitle("Hybrid A* Reference Trajectory",
                      color="white", fontsize=14, fontweight="bold")
 
-        gs = gridspec.GridSpec(2, 2,
+        gs = gridspec.GridSpec(3, 2,
                                left=0.07, right=0.97,
                                top=0.93,  bottom=0.07,
-                               hspace=0.40, wspace=0.32)
+                               hspace=0.45, wspace=0.30)
 
-        # Plot 1 — path planning (both rows, col 0)
+        # Plot 1 — path planning/reference geometry
         self.ax1 = self.fig.add_subplot(gs[0:2, 0])
         # Plot 2 — curvature (row 0, col 1)
         self.ax2 = self.fig.add_subplot(gs[0, 1])
         # Plot 3 — velocity (row 1, col 1)
         self.ax3 = self.fig.add_subplot(gs[1, 1])
+        # Plot 4 — steering (row 2, col 0)
+        self.ax4 = self.fig.add_subplot(gs[2, 0])
+        # Plot 5 — acceleration (row 2, col 1)
+        self.ax5 = self.fig.add_subplot(gs[2, 1])
 
-        for ax in [self.ax1, self.ax2, self.ax3]:
+        for ax in [self.ax1, self.ax2, self.ax3, self.ax4, self.ax5]:
             ax.set_facecolor("#2b2b3b")
             for spine in ax.spines.values():
                 spine.set_edgecolor("#555566")
@@ -246,7 +370,7 @@ class LiveDashboard:
             pts = path_to_xy(d["smooth"])
             sx, sy = zip(*pts)
             ax.plot(sx, sy, color=BLUE, linewidth=1.8,
-                    label="B-Spline", zorder=3)
+                    label="B-Spline + arc-length knots", zorder=3)
             ax.plot(sx[0],  sy[0],  "o", color=GREEN,  markersize=6, zorder=5)
             ax.plot(sx[-1], sy[-1], "*", color=RED,    markersize=9, zorder=5)
 
@@ -266,23 +390,34 @@ class LiveDashboard:
 
         if d["raw"] and d["raw"].poses:
             pts = path_to_xy(d["raw"])
-            s_raw = arc_lengths(pts)
-            k_raw = curvatures_from_path(pts)
+            s_raw, k_raw = derivative_curvature_profile(
+                pts, target_ds=0.05, filter_window=1)
             ax.plot(s_raw, k_raw, color=GRAY, linestyle="--",
-                    linewidth=1.0, alpha=0.7, label="Raw")
+                    linewidth=1.0, alpha=0.7, label="Raw curvature")
 
-        if d["smooth"] and d["smooth"].poses:
+        ref_pts = reference_xy(d["ref"])
+        if ref_pts and d["ref"].get("kappa"):
+            s = arc_lengths(ref_pts)
+            k = d["ref"]["kappa"][:len(s)]
+            ax.plot(s, k, color=BLUE, linewidth=1.6,
+                    label="Reference kappa")
+            ax.fill_between(s, k, alpha=0.12, color=BLUE)
+        elif d["smooth"] and d["smooth"].poses:
             pts = path_to_xy(d["smooth"])
-            s   = arc_lengths(pts)
-            k   = curvatures_from_path(pts)
+            s, k = curvature_topic_axis(pts, d["curv"])
+            label = "Improved /astar_curvature"
+            if not k:
+                s, k = derivative_curvature_profile(
+                    pts, target_ds=0.05, filter_window=5)
+                label = "Smooth derivative"
             if k:
-                ax.plot(s, k, color=BLUE, linewidth=1.6, label="Smooth")
+                ax.plot(s, k, color=BLUE, linewidth=1.6, label=label)
                 ax.fill_between(s, k, alpha=0.12, color=BLUE)
 
+        ax.axhline(0.0, color="white", linewidth=0.6, alpha=0.35)
         ax.legend(fontsize=6, facecolor="#3b3b4b",
                   labelcolor="white", framealpha=0.7)
         ax.grid(True, alpha=0.15, color="white")
-        ax.set_ylim(bottom=0)
         ax.tick_params(colors="white", labelsize=6)
 
     # ---- Plot 3: Velocity Profile ----------------------------------------
@@ -290,21 +425,35 @@ class LiveDashboard:
         ax = self.ax3
         ax.cla()
         ax.set_facecolor("#2b2b3b")
-        ax.set_title("3 — Velocity Profile v(s)", fontsize=9, color="white")
-        ax.set_xlabel("Arc length s (m)", fontsize=7)
-        ax.set_ylabel("v (m/s)", fontsize=7)
+        ax.set_title("3 — Velocity Profile", fontsize=9, color="white")
+        ax.set_ylabel("v_ref (m/s)", fontsize=7)
 
-        if d["smooth"] and d["smooth"].poses and d["vel"]:
-            pts = path_to_xy(d["smooth"])
-            n   = min(len(pts), len(d["vel"]))
-            s   = arc_lengths(pts[:n])
-            v   = d["vel"][:n]
-            ax.plot(s, v, color=RED, linewidth=1.8, label="v(s)")
-            ax.fill_between(s, v, alpha=0.15, color=RED)
-            # Mark cusps
+        x = []
+        v = []
+        xlabel = "Arc length s (m)"
+        label = "v_ref(s)"
+        if d["ref"].get("v_ref"):
+            v = d["ref"]["v_ref"]
+            if d["ref"].get("t") and len(d["ref"]["t"]) == len(v):
+                x = d["ref"]["t"]
+                xlabel = "Time t (s)"
+                label = "v_ref(t)"
+            else:
+                x = path_axis_for_series(d, len(v))
+        elif d["smooth"] and d["smooth"].poses and d["vel"]:
+            v = d["vel"]
+            x = path_axis_for_series(d, len(v))
+
+        ax.set_xlabel(xlabel, fontsize=7)
+        if x and v:
+            n = min(len(x), len(v))
+            x = x[:n]
+            v = v[:n]
+            ax.plot(x, v, color=RED, linewidth=1.8, label=label)
+            ax.fill_between(x, v, alpha=0.15, color=RED)
             for i in range(1, n):
                 if v[i] < 0.05 and 0 < i < n-1:
-                    ax.axvline(s[i], color=ORANGE, linestyle=":",
+                    ax.axvline(x[i], color=ORANGE, linestyle=":",
                                linewidth=0.9, alpha=0.6)
             if v:
                 v_max = max(v)
@@ -317,80 +466,75 @@ class LiveDashboard:
         ax.grid(True, alpha=0.15, color="white")
         ax.tick_params(colors="white", labelsize=6)
 
-    # ---- Plot 4: Tracking -----------------------------------------------
+    # ---- Plot 4: Steering ------------------------------------------------
     def _update_plot4(self, d):
         ax = self.ax4
         ax.cla()
         ax.set_facecolor("#2b2b3b")
-        ax.set_title("4 — Closed-Loop Tracking", fontsize=9, color="white")
-        ax.set_xlabel("X (m)", fontsize=7); ax.set_ylabel("Y (m)", fontsize=7)
+        ax.set_title("4 — Steering δ", fontsize=9, color="white")
+        ax.set_ylabel("δ (rad)", fontsize=7)
 
-        self._draw_grid_background(ax, d["grid"])
+        x = []
+        delta = []
+        xlabel = "Arc length s (m)"
+        if d["ref"].get("delta"):
+            delta = d["ref"]["delta"]
+            if d["ref"].get("t") and len(d["ref"]["t"]) == len(delta):
+                x = d["ref"]["t"]
+                xlabel = "Time t (s)"
+            else:
+                x = path_axis_for_series(d, len(delta))
+        elif d["steer"]:
+            delta = d["steer"]
+            x = path_axis_for_series(d, len(delta))
 
-        if d["smooth"] and d["smooth"].poses:
-            pts = path_to_xy(d["smooth"])
-            sx, sy = zip(*pts)
-            ax.plot(sx, sy, color=BLUE, linewidth=1.8,
-                    label="Reference", zorder=3)
-            ax.plot(sx[0],  sy[0],  "o", color=GREEN, markersize=6, zorder=5)
-            ax.plot(sx[-1], sy[-1], "*", color=RED,   markersize=9, zorder=5)
+        ax.set_xlabel(xlabel, fontsize=7)
+        if x and delta:
+            n = min(len(x), len(delta))
+            ax.plot(x[:n], delta[:n], color=ORANGE, linewidth=1.5,
+                    label="delta_ref")
+            ax.fill_between(x[:n], delta[:n], alpha=0.12, color=ORANGE)
 
-        if d["odom"]:
-            ox, oy = zip(*d["odom"])
-            ax.plot(ox, oy, color=RED, linewidth=1.5,
-                    linestyle="-", alpha=0.85,
-                    label="Actual (MPC)", zorder=4)
-            # Current vehicle position
-            ax.plot(ox[-1], oy[-1], "D", color=ORANGE,
-                    markersize=7, zorder=6, label="Vehicle now")
-
-        ax.legend(fontsize=6, loc="upper left",
-                  facecolor="#3b3b4b", labelcolor="white", framealpha=0.7)
-        ax.set_aspect("equal"); ax.grid(True, alpha=0.15, color="white")
+        ax.axhline(0.0, color="white", linewidth=0.6, alpha=0.35)
+        ax.legend(fontsize=6, facecolor="#3b3b4b",
+                  labelcolor="white", framealpha=0.7)
+        ax.grid(True, alpha=0.15, color="white")
         ax.tick_params(colors="white", labelsize=6)
 
-    # ---- Plot 5: Tracking Errors ----------------------------------------
+    # ---- Plot 5: Acceleration -------------------------------------------
     def _update_plot5(self, d):
-        specs = [
-            (self.ax5a, d["err_lat"], "e_lat (m)",   BLUE,   0.30),
-            (self.ax5b, d["err_yaw"], "e_yaw (°)",   ORANGE, 5.0),
-            (self.ax5c, d["err_v"],   "e_v (m/s)",   GREEN,  0.50),
-        ]
-        t = d["err_t"]
+        ax = self.ax5
+        ax.cla()
+        ax.set_facecolor("#2b2b3b")
+        ax.set_title("5 — Acceleration a", fontsize=9, color="white")
+        ax.set_ylabel("a (m/s²)", fontsize=7)
 
-        for i, (ax, data, ylabel, color, thresh) in enumerate(specs):
-            ax.cla()
-            ax.set_facecolor("#2b2b3b")
-            ax.set_ylabel(ylabel, fontsize=7, color="white")
-            ax.tick_params(colors="white", labelsize=6)
-            ax.grid(True, alpha=0.15, color="white")
-
-            if i == 0:
-                ax.set_title("5 — Tracking Errors", fontsize=9, color="white")
-            if i == 2:
-                ax.set_xlabel("Time t (s)", fontsize=7, color="white")
-
-            if t and data:
-                ax.plot(t, data, color=color, linewidth=1.3)
-                ax.fill_between(t, data, alpha=0.15, color=color)
-                ax.axhline( thresh, color=RED, linestyle="--",
-                            linewidth=0.8, alpha=0.5)
-                ax.axhline(-thresh, color=RED, linestyle="--",
-                            linewidth=0.8, alpha=0.5)
-                ax.axhline(0, color="white", linewidth=0.5, alpha=0.3)
-                rms = math.sqrt(sum(e**2 for e in data) / len(data))
-                ax.text(0.97, 0.82, f"RMS={rms:.3f}",
-                        transform=ax.transAxes, ha="right",
-                        fontsize=7, color=color,
-                        bbox=dict(boxstyle="round,pad=0.2",
-                                  facecolor="#1e1e2e", alpha=0.7))
+        x = []
+        accel = []
+        xlabel = "Arc length s (m)"
+        if d["ref"].get("a"):
+            accel = d["ref"]["a"]
+            if d["ref"].get("t") and len(d["ref"]["t"]) == len(accel):
+                x = d["ref"]["t"]
+                xlabel = "Time t (s)"
             else:
-                ax.text(0.5, 0.5, "Waiting for MPC...",
-                        transform=ax.transAxes, ha="center",
-                        va="center", fontsize=8, color="#666677")
+                x = path_axis_for_series(d, len(accel))
+        elif d["accel"]:
+            accel = d["accel"]
+            x = path_axis_for_series(d, len(accel))
 
-            for spine in ax.spines.values():
-                spine.set_edgecolor("#555566")
+        ax.set_xlabel(xlabel, fontsize=7)
+        if x and accel:
+            n = min(len(x), len(accel))
+            ax.plot(x[:n], accel[:n], color=GREEN, linewidth=1.5,
+                    label="a_ref")
+            ax.fill_between(x[:n], accel[:n], alpha=0.12, color=GREEN)
+
+        ax.axhline(0.0, color="white", linewidth=0.6, alpha=0.35)
+        ax.legend(fontsize=6, facecolor="#3b3b4b",
+                  labelcolor="white", framealpha=0.7)
+        ax.grid(True, alpha=0.15, color="white")
+        ax.tick_params(colors="white", labelsize=6)
 
     # ---- Main update function -------------------------------------------
     def _update(self, frame):
@@ -398,6 +542,8 @@ class LiveDashboard:
         self._update_plot1(d)
         self._update_plot2(d)
         self._update_plot3(d)
+        self._update_plot4(d)
+        self._update_plot5(d)
         self.fig.canvas.draw_idle()
 
 

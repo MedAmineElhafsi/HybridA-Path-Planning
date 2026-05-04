@@ -28,6 +28,8 @@ add_executable(planner_node
   src/curves.cpp
   src/hybrid_astar.cpp
   src/smoother.cpp
+  src/curvature.cpp
+  src/reference_trajectory.cpp
   src/velocity_profile.cpp
   src/inverse_kinematics.cpp
 )

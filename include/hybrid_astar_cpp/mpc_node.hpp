@@ -34,6 +34,10 @@
 //     every control tick the node finds the closest waypoint to the current
 //     vehicle pose, then samples the reference at times t_0 + k·dt for
 //     k = 0..N by linear interpolation between waypoints.
+//
+// In the professor's block sketch this node is the vehicle model/controller
+// block after smoothing, velocity profiling and inverse kinematics.  It uses
+// MPC in place of a simpler PID lateral/longitudinal controller.
 class MpcNode : public rclcpp::Node {
 public:
     MpcNode();

@@ -1,31 +1,14 @@
 #include "hybrid_astar_cpp/velocity_profile.hpp"
+#include "hybrid_astar_cpp/curvature.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 
 namespace {
 
 // Arc-length between consecutive waypoints (Euclidean chord length).
 double arcLength(const Pose2D& a, const Pose2D& b) {
     return std::hypot(b.x - a.x, b.y - a.y);
-}
-
-// Menger curvature at the middle point of three consecutive waypoints.
-// Returns 0 when the three points are collinear or too close together.
-double mengerCurvature(const Pose2D& p0, const Pose2D& p1, const Pose2D& p2) {
-    const double ax = p1.x - p0.x,  ay = p1.y - p0.y;
-    const double bx = p2.x - p1.x,  by = p2.y - p1.y;
-    const double cx = p2.x - p0.x,  cy = p2.y - p0.y;
-
-    const double cross = ax * by - ay * bx;
-    const double a = std::hypot(ax, ay);
-    const double b = std::hypot(bx, by);
-    const double c = std::hypot(cx, cy);
-
-    const double denom = a * b * c;
-    if (denom < 1e-12) return 0.0;
-    return 2.0 * std::abs(cross) / denom;
 }
 
 // Speed cap imposed by lateral-acceleration budget at a given curvature.
@@ -40,11 +23,90 @@ bool isCusp(const std::vector<Pose2D>& path, size_t i) {
     return i > 0 && path[i].direction != path[i - 1].direction;
 }
 
+double segmentDt(double v_prev, double v_curr, double ds) {
+    constexpr double kMinTimeSpeed = 0.1;
+    const double v_avg = 0.5 * (std::abs(v_prev) + std::abs(v_curr));
+    return ds / std::max(kMinTimeSpeed, v_avg);
+}
+
+void applyJerkLimitedSmoothing(const std::vector<Pose2D>& path,
+                               const VelocityProfiler::Params& params,
+                               const std::vector<double>& v_ceil,
+                               std::vector<double>& v) {
+    const size_t n = path.size();
+    if (n < 3 || params.j_max <= 0.0) return;
+
+    // S-curve style pass: acceleration/deceleration are allowed to grow only
+    // by j_max * dt, so the velocity profile no longer has rectangular
+    // acceleration steps.  The final values are still clipped by curvature,
+    // acceleration, deceleration and cusp stop constraints.
+    constexpr int kPasses = 3;
+    for (int pass = 0; pass < kPasses; ++pass) {
+        double accel = 0.0;
+        v.front() = 0.0;
+
+        for (size_t i = 1; i < n; ++i) {
+            if (isCusp(path, i)) {
+                v[i] = 0.0;
+                accel = 0.0;
+                continue;
+            }
+
+            const double ds = arcLength(path[i - 1], path[i]);
+            if (ds < 1e-9) continue;
+
+            const double dt = segmentDt(v[i - 1], v[i], ds);
+            accel = std::min(params.a_max, accel + params.j_max * dt);
+            const double v_allowed = std::sqrt(
+                std::max(0.0, v[i - 1] * v[i - 1] + 2.0 * accel * ds));
+            v[i] = std::min({v[i], v_allowed, v_ceil[i]});
+
+            const double actual_accel =
+                (v[i] * v[i] - v[i - 1] * v[i - 1]) / (2.0 * ds);
+            accel = std::clamp(actual_accel, 0.0, params.a_max);
+        }
+
+        double decel = 0.0;
+        v.back() = 0.0;
+
+        for (int idx = static_cast<int>(n) - 2; idx >= 0; --idx) {
+            const size_t i = static_cast<size_t>(idx);
+            if (isCusp(path, i)) {
+                v[i] = 0.0;
+                decel = 0.0;
+                continue;
+            }
+
+            const bool boundary_after = (path[i + 1].direction != path[i].direction);
+            if (boundary_after) {
+                v[i + 1] = 0.0;
+                decel = 0.0;
+            }
+
+            const double ds = arcLength(path[i], path[i + 1]);
+            if (ds < 1e-9) continue;
+
+            const double dt = segmentDt(v[i], v[i + 1], ds);
+            decel = std::min(params.d_max, decel + params.j_max * dt);
+            const double v_allowed = std::sqrt(
+                std::max(0.0, v[i + 1] * v[i + 1] + 2.0 * decel * ds));
+            v[i] = std::min({v[i], v_allowed, v_ceil[i]});
+
+            const double actual_decel =
+                (v[i] * v[i] - v[i + 1] * v[i + 1]) / (2.0 * ds);
+            decel = std::clamp(actual_decel, 0.0, params.d_max);
+        }
+    }
+}
+
 }  // namespace
 
 void VelocityProfiler::compute(std::vector<Pose2D>& path,
                                 const Params& params,
-                                double safe_curvature_eps) {
+                                double safe_curvature_eps,
+                                double curvature_resample_ds,
+                                int curvature_filter_window,
+                                double curvature_rate_limit) {
     const size_t n = path.size();
     if (n == 0) return;
     if (n == 1) { path[0].velocity = 0.0; return; }
@@ -55,6 +117,8 @@ void VelocityProfiler::compute(std::vector<Pose2D>& path,
     //   Start, end, and cusp waypoints are hard zeros.
     // -----------------------------------------------------------------------
     std::vector<double> v_ceil(n, 0.0);
+    const std::vector<double> curvature = PathCurvature::computeAtPathPoints(
+        path, curvature_resample_ds, curvature_filter_window, curvature_rate_limit);
 
     for (size_t i = 1; i + 1 < n; ++i) {
         if (isCusp(path, i)) {
@@ -64,7 +128,7 @@ void VelocityProfiler::compute(std::vector<Pose2D>& path,
         const double v_max_i = (path[i].direction < 0)
             ? params.v_max_reverse : params.v_max;
 
-        const double k = mengerCurvature(path[i - 1], path[i], path[i + 1]);
+        const double k = (i < curvature.size()) ? std::abs(curvature[i]) : 0.0;
         v_ceil[i] = (k < safe_curvature_eps)
             ? v_max_i
             : curvatureSpeedLimit(k, params.a_lat_max, params.v_min_curv, v_max_i);
@@ -109,6 +173,8 @@ void VelocityProfiler::compute(std::vector<Pose2D>& path,
             std::max(0.0, v[ui + 1] * v[ui + 1] + 2.0 * params.d_max * ds));
         v[ui] = std::min(v[ui], v_decel);
     }
+
+    applyJerkLimitedSmoothing(path, params, v_ceil, v);
 
     // Write back — always non-negative (sign carried by direction field).
     for (size_t i = 0; i < n; ++i) {
