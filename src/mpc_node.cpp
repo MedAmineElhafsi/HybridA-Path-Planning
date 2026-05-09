@@ -7,6 +7,17 @@
 
 namespace {
 inline double wrapAngle(double a) { return std::atan2(std::sin(a), std::cos(a)); }
+
+int inferDirectionSign(const MpcController::State& pose,
+                       const MpcController::State& next) {
+    const double dx = next.x - pose.x;
+    const double dy = next.y - pose.y;
+    if (std::hypot(dx, dy) < 1e-6) return 1;
+
+    const double forward_projection =
+        std::cos(pose.yaw) * dx + std::sin(pose.yaw) * dy;
+    return (forward_projection < -1e-4) ? -1 : 1;
+}
 }  // namespace
 
 MpcNode::MpcNode() : Node("mpc_controller_node") {
@@ -111,6 +122,8 @@ void MpcNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(ref_mutex_);
     path_states_.clear();
     path_states_.reserve(msg->poses.size());
+    path_direction_sign_.clear();
+    path_direction_sign_.reserve(msg->poses.size());
     for (const auto& ps : msg->poses) {
         MpcController::State s;
         s.x   = ps.pose.position.x;
@@ -119,8 +132,21 @@ void MpcNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg) {
         s.v   = 0.0;     // filled by velocityCallback
         path_states_.push_back(s);
     }
+    path_direction_sign_.assign(path_states_.size(), 1);
+    for (size_t i = 0; i + 1 < path_states_.size(); ++i) {
+        path_direction_sign_[i] =
+            inferDirectionSign(path_states_[i], path_states_[i + 1]);
+    }
+    if (path_direction_sign_.size() >= 2) {
+        path_direction_sign_.back() = path_direction_sign_[path_direction_sign_.size() - 2];
+    }
     path_frame_id_ = msg->header.frame_id;
     has_path_     = !path_states_.empty();
+    has_vel_      = false;
+    has_steer_    = false;
+    has_accel_    = false;
+    path_delta_ref_.clear();
+    path_a_ref_.clear();
     goal_reached_ = false;   // new path resets goal-reached latch
     rebuildTimeAxis();
 }
@@ -130,7 +156,8 @@ void MpcNode::velocityCallback(const std_msgs::msg::Float64MultiArray::SharedPtr
     if (!has_path_) return;
     const size_t n = std::min(msg->data.size(), path_states_.size());
     for (size_t i = 0; i < n; ++i) {
-        path_states_[i].v = msg->data[i];
+        const int dir = (i < path_direction_sign_.size()) ? path_direction_sign_[i] : 1;
+        path_states_[i].v = static_cast<double>(dir) * std::abs(msg->data[i]);
     }
     has_vel_ = (n == path_states_.size());
     rebuildTimeAxis();
@@ -138,13 +165,25 @@ void MpcNode::velocityCallback(const std_msgs::msg::Float64MultiArray::SharedPtr
 
 void MpcNode::steeringCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(ref_mutex_);
-    path_delta_ref_ = msg->data;
+    path_delta_ref_.assign(msg->data.begin(), msg->data.end());
+    const size_t n = std::min(path_delta_ref_.size(), path_direction_sign_.size());
+    for (size_t i = 0; i < n; ++i) {
+        // For reverse, v is negative in the kinematic model, so feedforward
+        // steering must flip sign to track the same geometric curvature.
+        path_delta_ref_[i] *= static_cast<double>(path_direction_sign_[i]);
+    }
     has_steer_ = !path_delta_ref_.empty();
 }
 
 void MpcNode::accelerationCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(ref_mutex_);
-    path_a_ref_ = msg->data;
+    path_a_ref_.assign(msg->data.begin(), msg->data.end());
+    const size_t n = std::min(path_a_ref_.size(), path_direction_sign_.size());
+    for (size_t i = 0; i < n; ++i) {
+        // /astar_acceleration is along the path-speed magnitude.  MPC tracks
+        // signed body-frame velocity, so reverse acceleration is signed too.
+        path_a_ref_[i] *= static_cast<double>(path_direction_sign_[i]);
+    }
     has_accel_ = !path_a_ref_.empty();
 }
 

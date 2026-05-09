@@ -898,6 +898,10 @@ void PlannerNode::planPath() {
         last_footprint_count_ = 0;
     }
 
+    // Publish geometry before the aligned arrays so controllers can infer
+    // forward/reverse segment signs from the path before velocity/IK arrive.
+    path_pub_->publish(path_msg);
+
     // Publish velocity profile — one entry per path pose, in the same order.
     // Subscribers (e.g. MPC controller) match indices with path_msg.poses[i].
     std_msgs::msg::Float64MultiArray vel_msg;
@@ -935,7 +939,6 @@ void PlannerNode::planPath() {
     reference_trajectory_pub_->publish(
         ReferenceTrajectory::toMessage(reference_trajectory));
 
-    path_pub_->publish(path_msg);
     footprint_pub_->publish(marker_array);
 }
 

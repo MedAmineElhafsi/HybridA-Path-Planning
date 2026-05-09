@@ -130,7 +130,7 @@ planner_node:
     #     (4.0 m/s) is only reached on straight or gently curved segments.
     # -------------------------------------------------------------------------
     vel_max:           4.0    # max forward speed (m/s)  ~14.4 km/h
-    vel_max_reverse:   1.5    # max reverse speed (m/s)  ~ 5.4 km/h
+    vel_max_reverse:   2.0    # max reverse speed (m/s)  ~ 5.4 km/h
     vel_accel_max:     1.5    # max longitudinal acceleration (m/s²)
     vel_decel_max:     2.5    # max longitudinal deceleration (m/s²)
     vel_jerk_max:      1.2    # jerk limit for softer S-curve-like v_ref smoothing (m/s³)

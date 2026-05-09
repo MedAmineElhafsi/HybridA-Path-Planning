@@ -29,6 +29,9 @@
 //
 // Reference construction:
 //     The published path, velocity and IK arrays are stored internally.
+//     Reverse motion is inferred from path geometry: if the displacement to
+//     the next knot is opposite the vehicle yaw, MPC tracks signed negative
+//     body-frame velocity while the dashboard can keep plotting speed magnitude.
 //     A per-waypoint arc-length and cumulative time are pre-computed from
 //     the velocity profile (t_{i+1} = t_i + ds_i / ((v_i+v_{i+1})/2)).  At
 //     every control tick the node finds the closest waypoint to the current
@@ -79,6 +82,7 @@ private:
     // -- Cached reference trajectory ---------------------------------------
     std::mutex ref_mutex_;
     std::vector<MpcController::State>   path_states_;   // (x, y, θ, v)
+    std::vector<int>                    path_direction_sign_; // +1 forward, -1 reverse
     std::vector<double>                 path_a_ref_;    // a_ref per waypoint
     std::vector<double>                 path_delta_ref_;// δ_ref per waypoint
     std::vector<double>                 path_time_;     // cumulative time (s)
