@@ -5,31 +5,44 @@
 #include <Eigen/Dense>
 
 // =============================================================================
-// Linear Model Predictive Controller (MPC) — Ackermann kinematic vehicle
+// Linear Model Predictive Controller (MPC) — dynamic bicycle vehicle
 // -----------------------------------------------------------------------------
 //
-//   STATE        x = [X, Y, θ, v]ᵀ ∈ ℝ⁴           (rear-axle centre, world frame)
-//   INPUT        u = [a, δ]ᵀ       ∈ ℝ²            (acceleration, steering angle)
+//   STATE        x = [X, Y, θ, vx, vy, r]ᵀ ∈ ℝ⁶
+//                X,Y,θ are in the world frame; vx,vy,r are body-frame dynamics.
+//   INPUT        u = [a, δ]ᵀ ∈ ℝ²                 (longitudinal acceleration,
+//                                                  front steering angle)
 //
-//   CONTINUOUS DYNAMICS  ẋ = f(x,u)
-//       ẋ = v·cos(θ)          ẏ = v·sin(θ)
-//       θ̇ = (v/L)·tan(δ)      v̇ = a                      (L = wheelbase)
+//   CONTINUOUS DYNAMICS  ẋ = f(x,u), linear tire bicycle model
+//       X_dot   = vx·cos(θ) - vy·sin(θ)
+//       Y_dot   = vx·sin(θ) + vy·cos(θ)
+//       θ_dot   = r
+//       vx_dot  = a + vy·r
+//       vy_dot  = (Fyf + Fyr)/m - vx·r
+//       r_dot   = (lf·Fyf - lr·Fyr)/Iz
+//
+//       αf = δ - atan2(vy + lf·r, max(|vx|, vx_eps))
+//       αr =    - atan2(vy - lr·r, max(|vx|, vx_eps))
+//       Fyf = Cf·αf,  Fyr = Cr·αr
 //
 //   LINEARISATION at reference (x_r, u_r)
-//       A_c = ∂f/∂x |_ref     B_c = ∂f/∂u |_ref            (see .cpp for entries)
+//       A_c = ∂f/∂x |_ref     B_c = ∂f/∂u |_ref
+//       computed with centred finite differences so clamp/low-speed guards are
+//       reflected in the local model.
 //
 //   DISCRETISATION  (forward-Euler, step dt)
 //       A_d = I + dt·A_c         B_d = dt·B_c
+//       c_d = x_r,k + dt·f(x_r,k,u_r,k) − x_r,k+1
 //
 //   ERROR-STATE DYNAMICS       δx = x−x_r,  δu = u−u_r
-//       δx_{k+1} = A_{d,k}·δx_k + B_{d,k}·δu_k       (no affine term)
+//       δx_{k+1} = A_{d,k}·δx_k + B_{d,k}·δu_k + c_{d,k}
 //
 //   COST
 //       J = Σ_{k=0}^{N-1} δx_kᵀ Q δx_k + δu_kᵀ R δu_k    + δx_Nᵀ P δx_N
 //
-//   CONDENSED QP               δX = Φ·δx_0 + Γ·δU
+//   CONDENSED QP               δX = Φ·δx_0 + c̄ + Γ·δU
 //       min  ½·δUᵀ H δU + gᵀ δU     H = 2(Γᵀ Q̄ Γ + R̄)
-//        δU                          g = 2·Γᵀ Q̄ Φ δx_0
+//        δU                          g = 2·Γᵀ Q̄ (Φ·δx_0 + c̄)
 //       s.t. u_min − u_{r,k} ≤ δu_k ≤ u_max − u_{r,k}     (k = 0..N−1)
 //
 //   SOLVER   FISTA (Nesterov-accelerated projected gradient).
@@ -59,13 +72,26 @@ public:
     struct Params {
         int    horizon_N  = 20;     // prediction horizon (steps)
         double dt         = 0.1;    // MPC time step (s)
-        double wheelbase  = 2.7;    // L (m)
+        double wheelbase  = 2.7;    // planner/reference wheelbase (m)
 
-        // Stage cost Q — diagonal weights [q_x, q_y, q_yaw, q_v]
+        // Dynamic bicycle plant parameters.
+        double mass        = 1500.0;  // kg
+        double yaw_inertia = 2250.0;  // kg*m^2
+        double lf          = 1.2;     // front axle distance from CG (m)
+        double lr          = 1.5;     // rear axle distance from CG (m)
+        double Cf          = 60000.0; // front cornering stiffness (N/rad)
+        double Cr          = 60000.0; // rear cornering stiffness (N/rad)
+        double vx_eps      = 0.5;     // slip denominator guard (m/s)
+        double slip_angle_limit = 0.5;    // rad
+        double tire_force_limit = 8000.0; // N
+
+        // Stage cost Q — diagonal weights [q_x, q_y, q_yaw, q_vx, q_vy, q_r]
         double q_x      = 5.0;
         double q_y      = 5.0;
         double q_yaw    = 3.0;
-        double q_v      = 1.0;
+        double q_vx     = 1.0;
+        double q_vy     = 0.5;
+        double q_r      = 0.5;
 
         // Stage cost R — diagonal weights [r_a, r_delta]
         double r_a      = 0.1;
@@ -75,7 +101,9 @@ public:
         double p_x      = 50.0;
         double p_y      = 50.0;
         double p_yaw    = 10.0;
-        double p_v      = 5.0;
+        double p_vx     = 5.0;
+        double p_vy     = 2.0;
+        double p_r      = 2.0;
 
         // Input constraints (absolute — so MPC limits u, not δu)
         double a_min        = -3.0,  a_max     = 2.0;     // m/s²
@@ -86,7 +114,14 @@ public:
         double tol      = 1e-4;
     };
 
-    struct State   { double x = 0, y = 0, yaw = 0, v = 0; };
+    struct State {
+        double x = 0.0;
+        double y = 0.0;
+        double yaw = 0.0;
+        double vx = 0.0;
+        double vy = 0.0;
+        double r = 0.0;
+    };
     struct Control { double a = 0, delta = 0; };
 
     struct Result {
@@ -113,10 +148,27 @@ public:
     const Params& params() const { return params_; }
 
 private:
+    static constexpr int kStateDim = 6;
+    static constexpr int kControlDim = 2;
+
     // Jacobian discretisation at a single reference step.
     void linearise(const State& x_r, const Control& u_r,
-                   Eigen::Matrix4d&               A_d,
-                   Eigen::Matrix<double, 4, 2>&   B_d) const;
+                   Eigen::Matrix<double, kStateDim, kStateDim>& A_d,
+                   Eigen::Matrix<double, kStateDim, kControlDim>& B_d) const;
+
+    Eigen::Matrix<double, kStateDim, 1>
+    dynamicsVector(const State& x, const Control& u) const;
+
+    Eigen::Matrix<double, kStateDim, 1>
+    stateError(const State& x, const State& ref) const;
+
+    Eigen::Matrix<double, kStateDim, 1>
+    affineDefect(const State& ref_k, const Control& u_k,
+                 const State& ref_next) const;
+
+    static State statePlusDelta(
+        const State& x,
+        const Eigen::Matrix<double, kStateDim, 1>& dx);
 
     // Box-constrained QP:  min ½ uᵀH u + gᵀu   s.t.  lb ≤ u ≤ ub
     // Returns number of FISTA iterations used.

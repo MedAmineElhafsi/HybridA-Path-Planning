@@ -1,13 +1,13 @@
-"""Closed-loop launch — planner + MPC + kinematic simulator + RViz.
+"""Closed-loop launch — planner + MPC + dynamic bicycle simulator + RViz.
 
 Pipeline:
     GUI scene    ────►  /astar_grid
-    RViz Pose    ────►  /initialpose  ────► (a) planner_node  (b) simulator
+    RViz Pose    ────►  /initialpose  ────► (a) planner_node  (b) dynamic simulator
     RViz Goal    ────►  /goal_pose    ────►     planner_node
     planner_node ────►  /astar_path, /astar_velocity_profile,
                          /astar_steering, /astar_acceleration
     mpc_node     ────►  /mpc_cmd                     (a, δ commands)
-    simulator    ────►  /odom + TF (closes the loop)
+    dynamic sim  ────►  /odom + TF (closes the loop)
 """
 import os
 
@@ -35,7 +35,7 @@ def generate_launch_description():
     )
     sim = Node(
         package="hybrid_astar_cpp", executable="kinematic_simulator.py",
-        name="kinematic_simulator", output="screen",
+        name="dynamic_bicycle_simulator", output="screen",
         parameters=[LaunchConfiguration("config")],
     )
     visualizer = Node(
