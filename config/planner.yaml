@@ -139,9 +139,11 @@ planner_node:
 
 
 # =============================================================================
-# Linear MPC controller
+# Dynamic bicycle MPC controller
 # -----------------------------------------------------------------------------
-#   Tracks the planner output (path + velocity profile + Ackermann IK).
+#   Tracks the planner output (path + velocity profile + steering/accel IK).
+#   The planner's v_ref is used as vx_ref, with vy_ref = 0 and
+#   r_ref = vx_ref / wheelbase * tan(delta_ref).
 #   Horizon = N · dt = 20 · 0.1 s = 2.0 s lookahead.
 # =============================================================================
 mpc_controller_node:
@@ -150,23 +152,36 @@ mpc_controller_node:
     mpc_horizon_N:   20          # prediction horizon length (steps)
     mpc_dt:          0.1         # MPC time step (s)
     wheelbase:       2.7         # must match planner_wheelbase
+    mass:            1500.0      # vehicle mass (kg)
+    yaw_inertia:     2250.0      # yaw inertia Iz (kg*m^2)
+    lf:              1.2         # CG to front axle (m)
+    lr:              1.5         # CG to rear axle (m)
+    Cf:              60000.0     # front cornering stiffness (N/rad)
+    Cr:              60000.0     # rear cornering stiffness (N/rad)
+    vx_eps:          0.5         # slip denominator guard (m/s)
+    slip_angle_limit: 0.5        # slip-angle clamp (rad)
+    tire_force_limit: 8000.0     # lateral force clamp per axle (N)
 
-    # State-tracking weights  Q = diag(q_x, q_y, q_yaw, q_v)
+    # State-tracking weights  Q = diag(q_x, q_y, q_yaw, q_vx, q_vy, q_r)
     q_x:   5.0
     q_y:   5.0
     q_yaw: 3.0
-    q_v:   1.0
+    q_vx:  1.0
+    q_vy:  0.5
+    q_r:   0.5
 
     # Input-effort weights    R = diag(r_a, r_delta)
     r_a:      0.1
     r_delta:  1.0
 
-    # Terminal weights        P = diag(p_x, p_y, p_yaw, p_v)
+    # Terminal weights        P = diag(p_x, p_y, p_yaw, p_vx, p_vy, p_r)
     #   Rule of thumb: P ~ 10·Q for tracking stability.
     p_x:   50.0
     p_y:   50.0
     p_yaw: 10.0
-    p_v:   5.0
+    p_vx:  5.0
+    p_vy:  2.0
+    p_r:   2.0
 
     # Input box constraints (absolute — applied on u, not on δu)
     a_min:    -3.0               # max braking  (m/s²)
@@ -182,22 +197,32 @@ mpc_controller_node:
     cmd_topic:  "/mpc_cmd"
 
 # =============================================================================
-# Ackermann kinematic simulator (closes the loop with the MPC for testing)
+# Dynamic bicycle simulator (closes the loop with the MPC for testing)
 # =============================================================================
-kinematic_simulator:
+dynamic_bicycle_simulator:
   ros__parameters:
-    wheelbase:          2.7
+    mass:               1500.0
+    yaw_inertia:        2250.0
+    lf:                 1.2
+    lr:                 1.5
+    Cf:                 60000.0
+    Cr:                 60000.0
+    vx_eps:             0.5
+    slip_angle_limit:   0.5
+    tire_force_limit:   8000.0
     integrate_rate_hz:  100.0
     publish_rate_hz:    50.0
+    cmd_topic:          "/mpc_cmd"
     odom_frame:         "map"
     base_frame:         "base_link"
-    cmd_topic:          "/mpc_cmd"
     a_min:    -5.0
     a_max:     3.0
     delta_min: -0.6
     delta_max:  0.6
-    v_max:     10.0
-    v_min:     -5.0
+    vx_min:    -5.0
+    vx_max:    10.0
+    vy_limit:   4.0
+    yaw_rate_limit: 2.0
 
 # =============================================================================
 # Animated vehicle visualizer

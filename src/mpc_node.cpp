@@ -4,6 +4,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace {
 inline double wrapAngle(double a) { return std::atan2(std::sin(a), std::cos(a)); }
@@ -26,11 +27,23 @@ MpcNode::MpcNode() : Node("mpc_controller_node") {
     this->declare_parameter("mpc_horizon_N",   20);
     this->declare_parameter("mpc_dt",          0.1);
     this->declare_parameter("wheelbase",       2.7);
+    this->declare_parameter("mass",            1500.0);
+    this->declare_parameter("yaw_inertia",     2250.0);
+    this->declare_parameter("lf",              1.2);
+    this->declare_parameter("lr",              1.5);
+    this->declare_parameter("Cf",              60000.0);
+    this->declare_parameter("Cr",              60000.0);
+    this->declare_parameter("vx_eps",          0.5);
+    this->declare_parameter("slip_angle_limit", 0.5);
+    this->declare_parameter("tire_force_limit", 8000.0);
 
     this->declare_parameter("q_x",      5.0);
     this->declare_parameter("q_y",      5.0);
     this->declare_parameter("q_yaw",    3.0);
     this->declare_parameter("q_v",      1.0);
+    this->declare_parameter("q_vx",     this->get_parameter("q_v").as_double());
+    this->declare_parameter("q_vy",     0.5);
+    this->declare_parameter("q_r",      0.5);
 
     this->declare_parameter("r_a",      0.1);
     this->declare_parameter("r_delta",  1.0);
@@ -39,6 +52,9 @@ MpcNode::MpcNode() : Node("mpc_controller_node") {
     this->declare_parameter("p_y",      50.0);
     this->declare_parameter("p_yaw",    10.0);
     this->declare_parameter("p_v",      5.0);
+    this->declare_parameter("p_vx",     this->get_parameter("p_v").as_double());
+    this->declare_parameter("p_vy",     2.0);
+    this->declare_parameter("p_r",      2.0);
 
     this->declare_parameter("a_min",     -3.0);
     this->declare_parameter("a_max",      2.0);
@@ -58,16 +74,29 @@ MpcNode::MpcNode() : Node("mpc_controller_node") {
     p.horizon_N = this->get_parameter("mpc_horizon_N").as_int();
     p.dt        = this->get_parameter("mpc_dt").as_double();
     p.wheelbase = this->get_parameter("wheelbase").as_double();
+    p.mass      = this->get_parameter("mass").as_double();
+    p.yaw_inertia = this->get_parameter("yaw_inertia").as_double();
+    p.lf        = this->get_parameter("lf").as_double();
+    p.lr        = this->get_parameter("lr").as_double();
+    p.Cf        = this->get_parameter("Cf").as_double();
+    p.Cr        = this->get_parameter("Cr").as_double();
+    p.vx_eps    = this->get_parameter("vx_eps").as_double();
+    p.slip_angle_limit = this->get_parameter("slip_angle_limit").as_double();
+    p.tire_force_limit = this->get_parameter("tire_force_limit").as_double();
     p.q_x       = this->get_parameter("q_x").as_double();
     p.q_y       = this->get_parameter("q_y").as_double();
     p.q_yaw     = this->get_parameter("q_yaw").as_double();
-    p.q_v       = this->get_parameter("q_v").as_double();
+    p.q_vx      = this->get_parameter("q_vx").as_double();
+    p.q_vy      = this->get_parameter("q_vy").as_double();
+    p.q_r       = this->get_parameter("q_r").as_double();
     p.r_a       = this->get_parameter("r_a").as_double();
     p.r_delta   = this->get_parameter("r_delta").as_double();
     p.p_x       = this->get_parameter("p_x").as_double();
     p.p_y       = this->get_parameter("p_y").as_double();
     p.p_yaw     = this->get_parameter("p_yaw").as_double();
-    p.p_v       = this->get_parameter("p_v").as_double();
+    p.p_vx      = this->get_parameter("p_vx").as_double();
+    p.p_vy      = this->get_parameter("p_vy").as_double();
+    p.p_r       = this->get_parameter("p_r").as_double();
     p.a_min     = this->get_parameter("a_min").as_double();
     p.a_max     = this->get_parameter("a_max").as_double();
     p.delta_min = this->get_parameter("delta_min").as_double();
@@ -75,6 +104,7 @@ MpcNode::MpcNode() : Node("mpc_controller_node") {
     p.max_iter  = this->get_parameter("fista_max_iter").as_int();
     p.tol       = this->get_parameter("fista_tol").as_double();
     mpc_ = std::make_unique<MpcController>(p);
+    wheelbase_ = std::max(1e-3, p.wheelbase);
     goal_reach_radius_ = this->get_parameter("goal_reach_radius").as_double();
     goal_reach_speed_  = this->get_parameter("goal_reach_speed").as_double();
 
@@ -112,7 +142,7 @@ MpcNode::MpcNode() : Node("mpc_controller_node") {
         std::bind(&MpcNode::controlTick, this));
 
     RCLCPP_INFO(this->get_logger(),
-        "MPC node up: N=%d dt=%.3f rate=%.1fHz", p.horizon_N, p.dt, rate_hz);
+        "Dynamic bicycle MPC node up: N=%d dt=%.3f rate=%.1fHz", p.horizon_N, p.dt, rate_hz);
 }
 
 // -------------------------------------------------------------------------
@@ -129,7 +159,9 @@ void MpcNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg) {
         s.x   = ps.pose.position.x;
         s.y   = ps.pose.position.y;
         s.yaw = tf2::getYaw(ps.pose.orientation);
-        s.v   = 0.0;     // filled by velocityCallback
+        s.vx  = 0.0;     // filled by velocityCallback
+        s.vy  = 0.0;
+        s.r   = 0.0;     // updated after steeringCallback
         path_states_.push_back(s);
     }
     path_direction_sign_.assign(path_states_.size(), 1);
@@ -157,8 +189,10 @@ void MpcNode::velocityCallback(const std_msgs::msg::Float64MultiArray::SharedPtr
     const size_t n = std::min(msg->data.size(), path_states_.size());
     for (size_t i = 0; i < n; ++i) {
         const int dir = (i < path_direction_sign_.size()) ? path_direction_sign_[i] : 1;
-        path_states_[i].v = static_cast<double>(dir) * std::abs(msg->data[i]);
+        path_states_[i].vx = static_cast<double>(dir) * std::abs(msg->data[i]);
+        path_states_[i].vy = 0.0;
     }
+    updateReferenceYawRates();
     has_vel_ = (n == path_states_.size());
     rebuildTimeAxis();
 }
@@ -168,10 +202,11 @@ void MpcNode::steeringCallback(const std_msgs::msg::Float64MultiArray::SharedPtr
     path_delta_ref_.assign(msg->data.begin(), msg->data.end());
     const size_t n = std::min(path_delta_ref_.size(), path_direction_sign_.size());
     for (size_t i = 0; i < n; ++i) {
-        // For reverse, v is negative in the kinematic model, so feedforward
-        // steering must flip sign to track the same geometric curvature.
+        // For reverse, vx is negative, so feedforward steering flips sign to
+        // track the same geometric curvature.
         path_delta_ref_[i] *= static_cast<double>(path_direction_sign_[i]);
     }
+    updateReferenceYawRates();
     has_steer_ = !path_delta_ref_.empty();
 }
 
@@ -192,8 +227,26 @@ void MpcNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
     current_state_.x   = msg->pose.pose.position.x;
     current_state_.y   = msg->pose.pose.position.y;
     current_state_.yaw = tf2::getYaw(msg->pose.pose.orientation);
-    current_state_.v   = msg->twist.twist.linear.x;
+    current_state_.vx  = msg->twist.twist.linear.x;
+    current_state_.vy  = msg->twist.twist.linear.y;
+    current_state_.r   = msg->twist.twist.angular.z;
     has_odom_ = true;
+}
+
+void MpcNode::updateReferenceYawRates() {
+    if (path_states_.empty() || path_delta_ref_.empty()) {
+        for (auto& s : path_states_) {
+            s.vy = 0.0;
+            s.r = 0.0;
+        }
+        return;
+    }
+
+    for (size_t i = 0; i < path_states_.size(); ++i) {
+        const size_t idx = std::min(i, path_delta_ref_.size() - 1);
+        path_states_[i].vy = 0.0;
+        path_states_[i].r = path_states_[i].vx * std::tan(path_delta_ref_[idx]) / wheelbase_;
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -207,8 +260,8 @@ void MpcNode::rebuildTimeAxis() {
     for (size_t i = 1; i < n; ++i) {
         const double ds = std::hypot(path_states_[i].x - path_states_[i-1].x,
                                      path_states_[i].y - path_states_[i-1].y);
-        const double v1 = std::abs(path_states_[i-1].v);
-        const double v2 = std::abs(path_states_[i].v);
+        const double v1 = std::abs(path_states_[i-1].vx);
+        const double v2 = std::abs(path_states_[i].vx);
         const double v_avg = std::max(0.1, 0.5 * (v1 + v2));
         path_time_[i] = path_time_[i-1] + ds / v_avg;
     }
@@ -254,7 +307,9 @@ bool MpcNode::buildReferenceHorizon(
         if (i >= n - 1) {
             // Beyond end of path — freeze on last waypoint (stopped, δ=0, a=0)
             ref_x[k] = path_states_.back();
-            ref_x[k].v = 0.0;
+            ref_x[k].vx = 0.0;
+            ref_x[k].vy = 0.0;
+            ref_x[k].r = 0.0;
             if (k < N) { ref_u[k].a = 0.0; ref_u[k].delta = 0.0; }
             continue;
         }
@@ -269,7 +324,9 @@ bool MpcNode::buildReferenceHorizon(
         ref_x[k].x   = s0.x + alpha * (s1.x - s0.x);
         ref_x[k].y   = s0.y + alpha * (s1.y - s0.y);
         ref_x[k].yaw = s0.yaw + alpha * wrapAngle(s1.yaw - s0.yaw);
-        ref_x[k].v   = s0.v + alpha * (s1.v - s0.v);
+        ref_x[k].vx  = s0.vx + alpha * (s1.vx - s0.vx);
+        ref_x[k].vy  = 0.0;
+        ref_x[k].r   = s0.r + alpha * (s1.r - s0.r);
 
         // Reference controls — step-constant per segment (feedforward from IK)
         if (k < N) {
@@ -301,14 +358,15 @@ void MpcNode::controlTick() {
         if (has_path_ && !goal_reached_) {
             const auto& goal = path_states_.back();
             const double dist = std::hypot(x0.x - goal.x, x0.y - goal.y);
-            if (dist < goal_reach_radius_ && std::abs(x0.v) < goal_reach_speed_)
+            if (dist < goal_reach_radius_ && std::abs(x0.vx) < goal_reach_speed_)
                 goal_reached_ = true;
         }
     }
     if (goal_reached_) {
         std_msgs::msg::Float64MultiArray cmd;
         // Apply gentle braking until fully stopped, then hold zero.
-        cmd.data = { (std::abs(x0.v) > 0.05 ? -1.0 : 0.0), 0.0 };
+        const double brake = (std::abs(x0.vx) > 0.05) ? -std::copysign(1.0, x0.vx) : 0.0;
+        cmd.data = {brake, 0.0};
         cmd_pub_->publish(cmd);
         return;
     }
@@ -362,14 +420,14 @@ void MpcNode::controlTick() {
     }
     predicted_pub_->publish(pred);
 
-    // -- Publish tracking errors  [e_lat, e_yaw, e_v] --
+    // -- Publish tracking errors  [e_lat, e_yaw, e_vx] --
     //    Cross-track (lateral) error in the reference frame:
     //    e_lat = −sin(θ_r)·(x−x_r) + cos(θ_r)·(y−y_r)
     const double dxw = x0.x - ref_x[0].x;
     const double dyw = x0.y - ref_x[0].y;
     const double e_lat = -std::sin(ref_x[0].yaw) * dxw + std::cos(ref_x[0].yaw) * dyw;
     const double e_yaw = wrapAngle(x0.yaw - ref_x[0].yaw);
-    const double e_v   = x0.v - ref_x[0].v;
+    const double e_v   = x0.vx - ref_x[0].vx;
     std_msgs::msg::Float64MultiArray err;
     err.data = {e_lat, e_yaw, e_v};
     error_pub_->publish(err);

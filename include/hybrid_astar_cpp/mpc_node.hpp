@@ -20,18 +20,20 @@
 //     /astar_velocity_profile  (v_ref per waypoint)
 //     /astar_steering          (δ_ref per waypoint — feedforward)
 //     /astar_acceleration      (a_ref per waypoint — feedforward)
-//     /odom                    (current state x,y,θ,v)
+//     /odom                    (current state x,y,θ,vx,vy,r)
 //
 // Publishes:
 //     /mpc_cmd                 (Float64MultiArray [a, δ])
 //     /mpc_predicted_path      (Path — MPC open-loop prediction for RViz)
-//     /mpc_tracking_error      (Float64MultiArray [e_y, e_yaw, e_v])
+//     /mpc_tracking_error      (Float64MultiArray [e_y, e_yaw, e_vx])
 //
 // Reference construction:
 //     The published path, velocity and IK arrays are stored internally.
 //     Reverse motion is inferred from path geometry: if the displacement to
 //     the next knot is opposite the vehicle yaw, MPC tracks signed negative
-//     body-frame velocity while the dashboard can keep plotting speed magnitude.
+//     body-frame longitudinal velocity while the dashboard can keep plotting
+//     speed magnitude.  The planner's v_ref becomes vx_ref, vy_ref is zero,
+//     and r_ref is generated from vx_ref and the steering feedforward.
 //     A per-waypoint arc-length and cumulative time are pre-computed from
 //     the velocity profile (t_{i+1} = t_i + ds_i / ((v_i+v_{i+1})/2)).  At
 //     every control tick the node finds the closest waypoint to the current
@@ -67,6 +69,9 @@ private:
     // Recompute cumulative-time parameterisation of the path.
     void rebuildTimeAxis();
 
+    // Fill dynamic reference fields not published directly by the planner.
+    void updateReferenceYawRates();
+
     // -- ROS I/O ------------------------------------------------------------
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr vel_sub_, steer_sub_, accel_sub_;
@@ -81,7 +86,7 @@ private:
 
     // -- Cached reference trajectory ---------------------------------------
     std::mutex ref_mutex_;
-    std::vector<MpcController::State>   path_states_;   // (x, y, θ, v)
+    std::vector<MpcController::State>   path_states_;   // (x, y, θ, vx, vy, r)
     std::vector<int>                    path_direction_sign_; // +1 forward, -1 reverse
     std::vector<double>                 path_a_ref_;    // a_ref per waypoint
     std::vector<double>                 path_delta_ref_;// δ_ref per waypoint
@@ -101,6 +106,7 @@ private:
     std::unique_ptr<MpcController>      mpc_;
     double                              control_dt_ = 0.05;   // control rate period (s)
     double                              lookahead_capture_radius_ = 25.0;
+    double                              wheelbase_ = 2.7;
 
     // -- Goal-reached state ------------------------------------------------
     // Set when the vehicle is within goal_reach_radius_ of the path endpoint

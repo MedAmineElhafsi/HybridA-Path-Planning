@@ -1,6 +1,7 @@
 #include "hybrid_astar_cpp/mpc_controller.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 
@@ -8,6 +9,12 @@ namespace {
 
 inline double wrapAngle(double a) {
     return std::atan2(std::sin(a), std::cos(a));
+}
+
+inline double smoothstep(double edge0, double edge1, double x) {
+    if (edge1 <= edge0) return 1.0;
+    const double t = std::clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
 }
 
 }  // namespace
@@ -22,46 +29,141 @@ void MpcController::reset() {
 }
 
 // ---------------------------------------------------------------------------
-// Continuous-time Jacobians, Euler discretisation.
-//
-//     A_c = [[0 0 -v_r sinθ_r   cosθ_r    ]
-//            [0 0  v_r cosθ_r   sinθ_r    ]
-//            [0 0    0           tanδ_r / L]
-//            [0 0    0              0     ]]
-//
-//     B_c = [[0                     0                  ]
-//            [0                     0                  ]
-//            [0                     v_r / (L·cos²δ_r)  ]
-//            [1                     0                  ]]
-//
-//     A_d = I + dt·A_c     B_d = dt·B_c
+// Dynamic bicycle model and finite-difference Jacobians.
 // ---------------------------------------------------------------------------
-void MpcController::linearise(const State& x_r, const Control& u_r,
-                               Eigen::Matrix4d&             A_d,
-                               Eigen::Matrix<double, 4, 2>& B_d) const {
-    const double L  = std::max(1e-3, params_.wheelbase);
-    const double v  = x_r.v;
-    const double th = x_r.yaw;
-    const double d  = u_r.delta;
+MpcController::State MpcController::statePlusDelta(
+    const State& x,
+    const Eigen::Matrix<double, kStateDim, 1>& dx)
+{
+    State y = x;
+    y.x += dx(0);
+    y.y += dx(1);
+    y.yaw = wrapAngle(y.yaw + dx(2));
+    y.vx += dx(3);
+    y.vy += dx(4);
+    y.r += dx(5);
+    return y;
+}
 
-    const double cos_th = std::cos(th);
-    const double sin_th = std::sin(th);
-    const double cos_d  = std::cos(d);
-    const double cos_d2 = std::max(1e-4, cos_d * cos_d);   // guard against δ≈±π/2
+Eigen::Matrix<double, MpcController::kStateDim, 1>
+MpcController::dynamicsVector(const State& x, const Control& u) const {
+    const double m = std::max(1.0, params_.mass);
+    const double Iz = std::max(1.0, params_.yaw_inertia);
+    const double lf = std::max(1e-3, params_.lf);
+    const double lr = std::max(1e-3, params_.lr);
+    const double vx_eps = std::max(1e-3, params_.vx_eps);
+    const double slip_limit = std::abs(params_.slip_angle_limit);
+    const double force_limit = std::abs(params_.tire_force_limit);
+    const double a = std::clamp(u.a, params_.a_min, params_.a_max);
+    const double delta = std::clamp(u.delta, params_.delta_min, params_.delta_max);
 
-    Eigen::Matrix4d A_c = Eigen::Matrix4d::Zero();
-    A_c(0, 2) = -v * sin_th;
-    A_c(0, 3) =  cos_th;
-    A_c(1, 2) =  v * cos_th;
-    A_c(1, 3) =  sin_th;
-    A_c(2, 3) =  std::tan(d) / L;
+    const double denom = std::max(std::abs(x.vx), vx_eps);
+    const double alpha_f =
+        std::clamp(delta - std::atan2(x.vy + lf * x.r, denom),
+                   -slip_limit, slip_limit);
+    const double alpha_r =
+        std::clamp(-std::atan2(x.vy - lr * x.r, denom),
+                   -slip_limit, slip_limit);
 
-    Eigen::Matrix<double, 4, 2> B_c = Eigen::Matrix<double, 4, 2>::Zero();
-    B_c(2, 1) = v / (L * cos_d2);     // ∂θ̇/∂δ
-    B_c(3, 0) = 1.0;                  // ∂v̇/∂a
+    const double Fyf = std::clamp(params_.Cf * alpha_f, -force_limit, force_limit);
+    const double Fyr = std::clamp(params_.Cr * alpha_r, -force_limit, force_limit);
+
+    const double c = std::cos(x.yaw);
+    const double s = std::sin(x.yaw);
+
+    Eigen::Matrix<double, kStateDim, 1> dyn;
+    dyn << x.vx * c - x.vy * s,
+           x.vx * s + x.vy * c,
+           x.r,
+           a + x.vy * x.r,
+           (Fyf + Fyr) / m - x.vx * x.r,
+           (lf * Fyf - lr * Fyr) / Iz;
+
+    const double low_speed_tau = 0.35;
+    const double L = std::max(1e-3, lf + lr);
+    const double target_r = x.vx * std::tan(delta) / L;
+
+    Eigen::Matrix<double, kStateDim, 1> low;
+    low << x.vx * c,
+           x.vx * s,
+           x.r,
+           a,
+           -x.vy / low_speed_tau,
+           (target_r - x.r) / low_speed_tau;
+
+    const double w = smoothstep(0.0, vx_eps, std::abs(x.vx));
+    return (1.0 - w) * low + w * dyn;
+}
+
+Eigen::Matrix<double, MpcController::kStateDim, 1>
+MpcController::stateError(const State& x, const State& ref) const {
+    Eigen::Matrix<double, kStateDim, 1> e;
+    e << x.x - ref.x,
+         x.y - ref.y,
+         wrapAngle(x.yaw - ref.yaw),
+         x.vx - ref.vx,
+         x.vy - ref.vy,
+         x.r - ref.r;
+    return e;
+}
+
+Eigen::Matrix<double, MpcController::kStateDim, 1>
+MpcController::affineDefect(const State& ref_k, const Control& u_k,
+                            const State& ref_next) const {
+    const auto f = dynamicsVector(ref_k, u_k);
+    const double dt = params_.dt;
+
+    Eigen::Matrix<double, kStateDim, 1> c;
+    c << ref_k.x + dt * f(0) - ref_next.x,
+         ref_k.y + dt * f(1) - ref_next.y,
+         wrapAngle(ref_k.yaw + dt * f(2) - ref_next.yaw),
+         ref_k.vx + dt * f(3) - ref_next.vx,
+         ref_k.vy + dt * f(4) - ref_next.vy,
+         ref_k.r + dt * f(5) - ref_next.r;
+    return c;
+}
+
+void MpcController::linearise(
+    const State& x_r,
+    const Control& u_r,
+    Eigen::Matrix<double, kStateDim, kStateDim>& A_d,
+    Eigen::Matrix<double, kStateDim, kControlDim>& B_d) const
+{
+    Eigen::Matrix<double, kStateDim, kStateDim> A_c =
+        Eigen::Matrix<double, kStateDim, kStateDim>::Zero();
+    Eigen::Matrix<double, kStateDim, kControlDim> B_c =
+        Eigen::Matrix<double, kStateDim, kControlDim>::Zero();
+
+    const std::array<double, kStateDim> x_eps = {
+        1e-4, 1e-4, 1e-5, 1e-4, 1e-4, 1e-5
+    };
+    for (int i = 0; i < kStateDim; ++i) {
+        Eigen::Matrix<double, kStateDim, 1> dx =
+            Eigen::Matrix<double, kStateDim, 1>::Zero();
+        dx(i) = x_eps[i];
+        const auto fp = dynamicsVector(statePlusDelta(x_r, dx), u_r);
+        const auto fm = dynamicsVector(statePlusDelta(x_r, -dx), u_r);
+        A_c.col(i) = (fp - fm) / (2.0 * x_eps[i]);
+    }
+
+    const std::array<double, kControlDim> u_eps = {1e-4, 1e-5};
+    for (int i = 0; i < kControlDim; ++i) {
+        Control up = u_r;
+        Control um = u_r;
+        if (i == 0) {
+            up.a += u_eps[i];
+            um.a -= u_eps[i];
+        } else {
+            up.delta += u_eps[i];
+            um.delta -= u_eps[i];
+        }
+        const auto fp = dynamicsVector(x_r, up);
+        const auto fm = dynamicsVector(x_r, um);
+        B_c.col(i) = (fp - fm) / (2.0 * u_eps[i]);
+    }
 
     const double dt = params_.dt;
-    A_d = Eigen::Matrix4d::Identity() + dt * A_c;
+    A_d = Eigen::Matrix<double, kStateDim, kStateDim>::Identity() + dt * A_c;
     B_d = dt * B_c;
 }
 
@@ -143,7 +245,7 @@ MpcController::Result MpcController::solve(
 
     Result R;
     const int N = params_.horizon_N;
-    const int nx = 4, nu = 2;
+    const int nx = kStateDim, nu = kControlDim;
 
     if (static_cast<int>(reference_x.size()) < N + 1 ||
         static_cast<int>(reference_u.size()) < N) {
@@ -153,34 +255,35 @@ MpcController::Result MpcController::solve(
     }
 
     // 1. Initial error δx₀ = x₀ − x_{r,0}  (wrap yaw)
-    Eigen::Vector4d dx0;
-    dx0(0) = x0.x   - reference_x[0].x;
-    dx0(1) = x0.y   - reference_x[0].y;
-    dx0(2) = wrapAngle(x0.yaw - reference_x[0].yaw);
-    dx0(3) = x0.v   - reference_x[0].v;
+    const Eigen::Matrix<double, kStateDim, 1> dx0 =
+        stateError(x0, reference_x[0]);
 
     // 2. Linearise at every reference knot
-    std::vector<Eigen::Matrix4d>              A_d(N);
-    std::vector<Eigen::Matrix<double, 4, 2>>  B_d(N);
+    std::vector<Eigen::Matrix<double, kStateDim, kStateDim>> A_d(N);
+    std::vector<Eigen::Matrix<double, kStateDim, kControlDim>> B_d(N);
+    std::vector<Eigen::Matrix<double, kStateDim, 1>> c_d(N);
     for (int k = 0; k < N; ++k) {
         linearise(reference_x[k], reference_u[k], A_d[k], B_d[k]);
+        c_d[k] = affineDefect(reference_x[k], reference_u[k], reference_x[k + 1]);
     }
 
-    // 3. Build condensation matrices  δX = Φ δx₀ + Γ δU
-    //    δX ∈ ℝ^{4N} stacks δx₁..δx_N   (δx₀ is known)
+    // 3. Build condensation matrices  δX = Φ δx₀ + affine + Γ δU
+    //    δX ∈ ℝ^{6N} stacks δx₁..δx_N   (δx₀ is known)
     //    δU ∈ ℝ^{2N} stacks δu₀..δu_{N-1}
     Eigen::MatrixXd Phi   = Eigen::MatrixXd::Zero(nx * N, nx);
     Eigen::MatrixXd Gamma = Eigen::MatrixXd::Zero(nx * N, nu * N);
+    Eigen::VectorXd affine = Eigen::VectorXd::Zero(nx * N);
 
     // Row-by-row incremental construction.
-    //   δx_{k+1} = A_d[k] · δx_k + B_d[k] · δu_k
+    //   δx_{k+1} = A_d[k] · δx_k + B_d[k] · δu_k + c_d[k]
     //   Previous row block is at index k-1 (for k ≥ 1), or Identity for k=0.
     for (int k = 0; k < N; ++k) {
         if (k == 0) {
             Phi.block(0, 0, nx, nx)            = A_d[0];
             Gamma.block(0, 0, nx, nu)          = B_d[0];
+            affine.segment(0, nx)              = c_d[0];
         } else {
-            // δx_{k+1} = A_d[k] · δx_k + B_d[k] · δu_k
+            // δx_{k+1} = A_d[k] · δx_k + B_d[k] · δu_k + c_d[k]
             Phi.block(nx * k, 0, nx, nx) =
                 A_d[k] * Phi.block(nx * (k - 1), 0, nx, nx);
 
@@ -190,37 +293,40 @@ MpcController::Result MpcController::solve(
 
             // Column j == k : directly B_d[k]
             Gamma.block(nx * k, nu * k, nx, nu) = B_d[k];
+
+            affine.segment(nx * k, nx) =
+                A_d[k] * affine.segment(nx * (k - 1), nx) + c_d[k];
         }
     }
 
-    // 4. Build reference-tracking error for stage costs
-    //    target_δX[k] = x_{r,k+1} − x_{r,k+1} = 0  (we track reference exactly)
-    //    But we must carry x₀ − x_{r,0} through via Φ δx₀; already done.
-    //    So we want to minimise ‖δX‖_Q̄² + ‖δU‖_R̄².
+    // 4. Build reference-tracking error for stage costs. The reference does
+    //    not have to be a perfect dynamic rollout; affine carries that defect.
 
-    Eigen::VectorXd Phi_dx0 = Phi * dx0;     // constant contribution in δX
+    Eigen::VectorXd constant_dx = Phi * dx0 + affine;
 
     // 5. Cost weights: block-diagonal Q̄ (stage + terminal), R̄ (stage)
     //    Q̄ rows:  δx₁..δx_{N-1} use Q,  δx_N uses P.
     Eigen::VectorXd Qbar_diag(nx * N);
     for (int k = 0; k < N - 1; ++k) {
-        Qbar_diag.segment<4>(nx * k) << params_.q_x, params_.q_y,
-                                        params_.q_yaw, params_.q_v;
+        Qbar_diag.segment<kStateDim>(nx * k) << params_.q_x, params_.q_y,
+                                                params_.q_yaw, params_.q_vx,
+                                                params_.q_vy, params_.q_r;
     }
     // Terminal block
-    Qbar_diag.segment<4>(nx * (N - 1)) << params_.p_x, params_.p_y,
-                                          params_.p_yaw, params_.p_v;
+    Qbar_diag.segment<kStateDim>(nx * (N - 1)) << params_.p_x, params_.p_y,
+                                                  params_.p_yaw, params_.p_vx,
+                                                  params_.p_vy, params_.p_r;
 
     Eigen::VectorXd Rbar_diag(nu * N);
     for (int k = 0; k < N; ++k) {
-        Rbar_diag.segment<2>(nu * k) << params_.r_a, params_.r_delta;
+        Rbar_diag.segment<kControlDim>(nu * k) << params_.r_a, params_.r_delta;
     }
 
     // 6. Condensed Hessian H and gradient g   (QP form:  min ½ δUᵀ H δU + gᵀ δU)
     //
-    //    J  = (Φ δx₀ + Γ δU)ᵀ Q̄ (Φ δx₀ + Γ δU) + δUᵀ R̄ δU
-    //       = δUᵀ (Γᵀ Q̄ Γ + R̄) δU  + 2·(Γᵀ Q̄ Φ δx₀)ᵀ δU + const
-    //    →  H = 2 (Γᵀ Q̄ Γ + R̄) ,   g = 2 Γᵀ Q̄ Φ δx₀
+    //    J  = (constant_dx + Γ δU)ᵀ Q̄ (constant_dx + Γ δU) + δUᵀ R̄ δU
+    //       = δUᵀ (Γᵀ Q̄ Γ + R̄) δU  + 2·(Γᵀ Q̄ constant_dx)ᵀ δU + const
+    //    →  H = 2 (Γᵀ Q̄ Γ + R̄) ,   g = 2 Γᵀ Q̄ constant_dx
     const Eigen::MatrixXd Qbar = Qbar_diag.asDiagonal();
     const Eigen::MatrixXd Rbar = Rbar_diag.asDiagonal();
 
@@ -228,7 +334,7 @@ MpcController::Result MpcController::solve(
     // Symmetrise (numerical cleanup)
     H = 0.5 * (H + H.transpose());
 
-    Eigen::VectorXd g = 2.0 * Gamma.transpose() * Qbar * Phi_dx0;
+    Eigen::VectorXd g = 2.0 * Gamma.transpose() * Qbar * constant_dx;
 
     // 7. Absolute input bounds converted to δU bounds:
     //    lb_k = u_min − u_{r,k} ,  ub_k = u_max − u_{r,k}
@@ -252,7 +358,7 @@ MpcController::Result MpcController::solve(
     warm_start_  = dU;
 
     // 10. Reconstruct δX for caller visualisation
-    Eigen::VectorXd dX = Phi_dx0 + Gamma * dU;
+    Eigen::VectorXd dX = constant_dx + Gamma * dU;
 
     // 11. Populate result
     R.predicted_u.resize(N);
@@ -266,7 +372,9 @@ MpcController::Result MpcController::solve(
         R.predicted_x[k + 1].x   = reference_x[k + 1].x   + dX(nx * k    );
         R.predicted_x[k + 1].y   = reference_x[k + 1].y   + dX(nx * k + 1);
         R.predicted_x[k + 1].yaw = wrapAngle(reference_x[k + 1].yaw + dX(nx * k + 2));
-        R.predicted_x[k + 1].v   = reference_x[k + 1].v   + dX(nx * k + 3);
+        R.predicted_x[k + 1].vx  = reference_x[k + 1].vx  + dX(nx * k + 3);
+        R.predicted_x[k + 1].vy  = reference_x[k + 1].vy  + dX(nx * k + 4);
+        R.predicted_x[k + 1].r   = reference_x[k + 1].r   + dX(nx * k + 5);
     }
 
     R.u = R.predicted_u[0];
