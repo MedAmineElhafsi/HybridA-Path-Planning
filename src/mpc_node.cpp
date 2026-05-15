@@ -95,7 +95,7 @@ MpcNode::MpcNode() : Node("mpc_controller_node") {
     this->declare_parameter("cmd_topic",           "/mpc_cmd");
     this->declare_parameter("goal_reach_radius",   0.5);
     this->declare_parameter("goal_reach_speed",    0.3);
-    this->declare_parameter("lookahead_capture_radius", 5.0);
+    this->declare_parameter("lookahead_capture_radius", 10.0);
     this->declare_parameter("launch_assist_accel", 0.8);
     this->declare_parameter("launch_assist_speed_threshold", 0.05);
     this->declare_parameter("launch_assist_ref_speed_threshold", 0.20);
@@ -252,9 +252,16 @@ void MpcNode::referenceTrajectoryCallback(
             msg->data.size());
         return;
     }
+    const size_t n = msg->data.size() / kFieldsPerPoint;
+    if (n < 2) {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "MPC reference trajectory ignored: need at least 2 points, got %zu.",
+            n);
+        return;
+    }
 
     std::lock_guard<std::mutex> lock(ref_mutex_);
-    const size_t n = msg->data.size() / kFieldsPerPoint;
 
     path_states_.clear();
     path_states_.reserve(n);
@@ -287,7 +294,7 @@ void MpcNode::referenceTrajectoryCallback(
         s.r = v_ref * kappa;
         path_states_.push_back(s);
 
-        path_direction_sign_.push_back(v_ref < -1e-4 ? -1 : 1);
+        path_direction_sign_.push_back(v_ref >= 0.0 ? 1 : -1);
         path_delta_ref_.push_back(delta);
         path_a_ref_.push_back(accel);
         path_time_.push_back(t);
@@ -311,10 +318,12 @@ void MpcNode::referenceTrajectoryCallback(
     last_reference_failure_reason_.clear();
     last_zero_reason_.clear();
 
+    const double duration =
+        path_time_.empty() ? 0.0 : (path_time_.back() - path_time_.front());
     RCLCPP_INFO(
         this->get_logger(),
-        "MPC reference trajectory received: %zu points",
-        n);
+        "MPC reference trajectory received: %zu points, duration %.3f s",
+        n, duration);
 }
 
 void MpcNode::velocityCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
@@ -407,16 +416,16 @@ void MpcNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
 }
 
 void MpcNode::logZeroCommandReason(const char* reason) {
-    const auto now = this->now();
-    const bool reason_changed = last_zero_reason_ != reason;
-    const bool throttle_elapsed =
-        last_zero_log_time_.nanoseconds() == 0 ||
-        (now - last_zero_log_time_).seconds() >= 2.0;
-    if (reason_changed || throttle_elapsed) {
+    // Log immediately whenever the reason changes, otherwise throttle so the
+    // same reason is re-emitted at most once every 2 s.
+    if (last_zero_reason_ != reason) {
         RCLCPP_WARN(this->get_logger(), "%s", reason);
         last_zero_reason_ = reason;
-        last_zero_log_time_ = now;
+        last_zero_log_time_ = this->now();
+        return;
     }
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000, "%s", reason);
 }
 
 void MpcNode::publishZeroCommand(const char* reason) {
@@ -658,13 +667,14 @@ void MpcNode::controlTick() {
         RCLCPP_INFO_THROTTLE(
             this->get_logger(), *this->get_clock(), 1000,
             "MPC readiness: has_odom=%s has_path=%s has_vel=%s "
-            "has_steer=%s has_accel=%s path_states=%zu path_a_ref=%zu "
-            "path_delta_ref=%zu path_time=%zu",
+            "has_steer=%s has_accel=%s has_reference_trajectory=%s "
+            "path_states=%zu path_a_ref=%zu path_delta_ref=%zu path_time=%zu",
             odom_ready ? "true" : "false",
             has_path_ ? "true" : "false",
             has_vel_ ? "true" : "false",
             has_steer_ ? "true" : "false",
             has_accel_ ? "true" : "false",
+            has_reference_trajectory_ ? "true" : "false",
             path_states_.size(), path_a_ref_.size(),
             path_delta_ref_.size(), path_time_.size());
     }
@@ -767,42 +777,25 @@ void MpcNode::controlTick() {
             nearest_ref_dist = std::sqrt(best_d2);
         }
 
-        if (!has_path_) {
-            not_ready_reason = "waiting for /astar_path";
-            zero_reason = "MPC zero: waiting for path";
+        const bool reference_inputs_ready =
+            has_path_ && has_vel_ && has_steer_ && has_accel_;
+        if (!reference_inputs_ready) {
+            not_ready_reason =
+                "waiting for /astar_reference_trajectory (or full fallback "
+                "set /astar_path + /astar_velocity_profile + /astar_steering "
+                "+ /astar_acceleration); has_path=" +
+                std::string(has_path_ ? "true" : "false") +
+                ", has_vel=" + (has_vel_ ? "true" : "false") +
+                ", has_steer=" + (has_steer_ ? "true" : "false") +
+                ", has_accel=" + (has_accel_ ? "true" : "false") +
+                ", has_reference_trajectory=" +
+                (has_reference_trajectory_ ? "true" : "false");
+            zero_reason = "MPC zero: waiting for reference trajectory";
         } else if (path_states_.size() < 2) {
-            not_ready_reason = "reference path has fewer than 2 points";
-            zero_reason = "MPC zero: path too short";
-        } else if (!has_vel_) {
-            if (velocity_profile_size_ == 0) {
-                not_ready_reason = "waiting for /astar_velocity_profile";
-            } else {
-                not_ready_reason =
-                    "velocity profile length mismatch: velocity=" +
-                    std::to_string(velocity_profile_size_) +
-                    ", path=" + std::to_string(path_states_.size());
-            }
-            zero_reason = "MPC zero: waiting for velocity profile";
-        } else if (!has_steer_) {
-            if (steering_profile_size_ == 0) {
-                not_ready_reason = "waiting for /astar_steering";
-            } else {
-                not_ready_reason =
-                    "steering profile length mismatch: steering=" +
-                    std::to_string(steering_profile_size_) +
-                    ", path=" + std::to_string(path_states_.size());
-            }
-            zero_reason = "MPC zero: waiting for steering profile";
-        } else if (!has_accel_) {
-            if (acceleration_profile_size_ == 0) {
-                not_ready_reason = "waiting for /astar_acceleration";
-            } else {
-                not_ready_reason =
-                    "acceleration profile length mismatch: acceleration=" +
-                    std::to_string(acceleration_profile_size_) +
-                    ", path=" + std::to_string(path_states_.size());
-            }
-            zero_reason = "MPC zero: waiting for acceleration profile";
+            not_ready_reason =
+                "reference has fewer than 2 points (size=" +
+                std::to_string(path_states_.size()) + ")";
+            zero_reason = "MPC zero: reference too short";
         } else {
             ready = buildReferenceHorizon(x0, ref_x, ref_u);
             nearest_ref_dist = last_nearest_ref_dist_;
