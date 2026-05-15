@@ -251,6 +251,8 @@ MpcController::Result MpcController::solve(
         static_cast<int>(reference_u.size()) < N) {
         R.u.a = 0.0;  R.u.delta = 0.0;
         R.success = false;
+        R.failure_reason =
+            "reference horizon has insufficient state/control samples";
         return R;
     }
 

@@ -2,6 +2,7 @@
 #define HYBRID_ASTAR_CPP_MPC_CONTROLLER_HPP_
 
 #include <vector>
+#include <string>
 #include <Eigen/Dense>
 
 // =============================================================================
@@ -132,6 +133,7 @@ public:
         double                 solve_time_ms = 0.0;
         double                 cost = 0.0;
         bool                   success = false;
+        std::string            failure_reason;
     };
 
     explicit MpcController(const Params& p);
