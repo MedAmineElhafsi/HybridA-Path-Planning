@@ -101,8 +101,8 @@ planner_node:
     #   Result is C2-continuous (smooth curvature) — required for MPC.
     #   blend: 0.0 = no change, 1.0 = pure spline
     # -------------------------------------------------------------------------
-    smoother_bspline_blend:      0.35   # stay visibly closer to the raw Hybrid A* path
-    smoother_max_point_shift:    0.12   # max lateral move per waypoint (m); 0 disables cap
+    smoother_bspline_blend:      2.0   # stay visibly closer to the raw Hybrid A* path
+    smoother_max_point_shift:    0.30   # max lateral move per waypoint (m); 0 disables cap
     smoother_goal_lock_distance: 2.5    # lock the last 2.5 m near goal (m)
     smoother_cusp_guard_points:  3      # lock N waypoints either side of cusps
 
@@ -195,6 +195,11 @@ mpc_controller_node:
 
     odom_topic: "/odom"
     cmd_topic:  "/mpc_cmd"
+    lookahead_capture_radius: 10.0
+    goal_latch_min_travel: 0.2
+    launch_assist_accel: 0.8
+    launch_assist_speed_threshold: 0.05
+    launch_assist_ref_speed_threshold: 0.20
 
 # =============================================================================
 # Dynamic bicycle simulator (closes the loop with the MPC for testing)

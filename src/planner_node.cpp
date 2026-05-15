@@ -16,6 +16,16 @@ double wrapAngle(double angle) {
     return std::atan2(std::sin(angle), std::cos(angle));
 }
 
+bool sameGridContent(const nav_msgs::msg::OccupancyGrid& a,
+                     const nav_msgs::msg::OccupancyGrid& b) {
+    constexpr double kEps = 1e-9;
+    return a.info.width == b.info.width &&
+           a.info.height == b.info.height &&
+           std::abs(a.info.resolution - b.info.resolution) < kEps &&
+           std::abs(a.info.origin.position.x - b.info.origin.position.x) < kEps &&
+           std::abs(a.info.origin.position.y - b.info.origin.position.y) < kEps &&
+           a.data == b.data;
+}
 
 Pose2D pose2DFromPose(const geometry_msgs::msg::Pose& pose) {
     return Pose2D{
@@ -363,9 +373,10 @@ void PlannerNode::gridCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg
     bool should_replan = false;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
+        const bool grid_changed = !has_grid_ || !sameGridContent(current_grid_, *msg);
         current_grid_ = *msg;
         has_grid_ = true;
-        should_replan = has_start_ && has_goal_;
+        should_replan = grid_changed && has_start_ && has_goal_;
     }
 
     if (should_replan) {
