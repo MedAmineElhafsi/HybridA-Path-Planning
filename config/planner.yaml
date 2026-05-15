@@ -195,6 +195,11 @@ mpc_controller_node:
 
     odom_topic: "/odom"
     cmd_topic:  "/mpc_cmd"
+    lookahead_capture_radius: 5.0
+    goal_latch_min_travel: 0.2
+    launch_assist_accel: 0.8
+    launch_assist_speed_threshold: 0.05
+    launch_assist_ref_speed_threshold: 0.20
 
 # =============================================================================
 # Dynamic bicycle simulator (closes the loop with the MPC for testing)
