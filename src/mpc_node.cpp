@@ -166,6 +166,9 @@ MpcNode::MpcNode() : Node("mpc_controller_node") {
     accel_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
         "astar_acceleration", 10,
         std::bind(&MpcNode::accelerationCallback, this, std::placeholders::_1));
+    reference_traj_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+        "astar_reference_trajectory", 10,
+        std::bind(&MpcNode::referenceTrajectoryCallback, this, std::placeholders::_1));
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
         odom_topic, 10,
         std::bind(&MpcNode::odomCallback, this, std::placeholders::_1));
@@ -192,6 +195,9 @@ MpcNode::MpcNode() : Node("mpc_controller_node") {
 // -------------------------------------------------------------------------
 void MpcNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(ref_mutex_);
+    if (has_reference_trajectory_) {
+        return;
+    }
     path_states_.clear();
     path_states_.reserve(msg->poses.size());
     path_direction_sign_.clear();
@@ -235,8 +241,87 @@ void MpcNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg) {
     rebuildTimeAxis();
 }
 
+void MpcNode::referenceTrajectoryCallback(
+    const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+    constexpr size_t kFieldsPerPoint = 8;
+    if (msg->data.empty() || (msg->data.size() % kFieldsPerPoint) != 0) {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "MPC reference trajectory ignored: expected a non-empty array "
+            "with size multiple of 8, got %zu values.",
+            msg->data.size());
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ref_mutex_);
+    const size_t n = msg->data.size() / kFieldsPerPoint;
+
+    path_states_.clear();
+    path_states_.reserve(n);
+    path_direction_sign_.clear();
+    path_direction_sign_.reserve(n);
+    path_delta_ref_.clear();
+    path_delta_ref_.reserve(n);
+    path_a_ref_.clear();
+    path_a_ref_.reserve(n);
+    path_time_.clear();
+    path_time_.reserve(n);
+
+    for (size_t i = 0; i < n; ++i) {
+        const size_t offset = kFieldsPerPoint * i;
+        const double x = msg->data[offset + 0];
+        const double y = msg->data[offset + 1];
+        const double yaw = msg->data[offset + 2];
+        const double v_ref = msg->data[offset + 3];
+        const double t = msg->data[offset + 4];
+        const double kappa = msg->data[offset + 5];
+        const double delta = msg->data[offset + 6];
+        const double accel = msg->data[offset + 7];
+
+        MpcController::State s;
+        s.x = x;
+        s.y = y;
+        s.yaw = yaw;
+        s.vx = v_ref;
+        s.vy = 0.0;
+        s.r = v_ref * kappa;
+        path_states_.push_back(s);
+
+        path_direction_sign_.push_back(v_ref < -1e-4 ? -1 : 1);
+        path_delta_ref_.push_back(delta);
+        path_a_ref_.push_back(accel);
+        path_time_.push_back(t);
+    }
+
+    velocity_profile_size_ = n;
+    steering_profile_size_ = n;
+    acceleration_profile_size_ = n;
+    has_path_ = true;
+    has_vel_ = true;
+    has_steer_ = true;
+    has_accel_ = true;
+    has_reference_trajectory_ = true;
+    goal_reached_ = false;
+    mpc_ready_logged_ = false;
+    steering_fallback_warned_ = false;
+    acceleration_fallback_warned_ = false;
+    path_follow_start_valid_ = false;
+    path_follow_travel_ = 0.0;
+    last_nearest_ref_valid_ = false;
+    last_reference_failure_reason_.clear();
+    last_zero_reason_.clear();
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "MPC reference trajectory received: %zu points",
+        n);
+}
+
 void MpcNode::velocityCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(ref_mutex_);
+    if (has_reference_trajectory_) {
+        return;
+    }
     velocity_profile_size_ = msg->data.size();
     if (!has_path_) return;
     std::vector<double> velocity = msg->data;
@@ -261,6 +346,9 @@ void MpcNode::velocityCallback(const std_msgs::msg::Float64MultiArray::SharedPtr
 
 void MpcNode::steeringCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(ref_mutex_);
+    if (has_reference_trajectory_) {
+        return;
+    }
     steering_profile_size_ = msg->data.size();
     std::vector<double> steering = msg->data;
     if (has_path_ && !steering.empty() && steering.size() != path_states_.size()) {
@@ -284,6 +372,9 @@ void MpcNode::steeringCallback(const std_msgs::msg::Float64MultiArray::SharedPtr
 
 void MpcNode::accelerationCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(ref_mutex_);
+    if (has_reference_trajectory_) {
+        return;
+    }
     acceleration_profile_size_ = msg->data.size();
     std::vector<double> acceleration = msg->data;
     if (has_path_ && !acceleration.empty() && acceleration.size() != path_states_.size()) {
@@ -750,6 +841,15 @@ void MpcNode::controlTick() {
     if (!ready) {
         MpcController::State nearest_ref;
         bool nearest_valid = false;
+        bool has_path_snapshot = false;
+        bool has_vel_snapshot = false;
+        bool has_steer_snapshot = false;
+        bool has_accel_snapshot = false;
+        bool has_reference_trajectory_snapshot = false;
+        size_t path_states_size = 0;
+        size_t path_delta_size = 0;
+        size_t path_a_size = 0;
+        size_t path_time_size = 0;
         size_t velocity_size = 0;
         size_t steering_size = 0;
         size_t acceleration_size = 0;
@@ -757,6 +857,15 @@ void MpcNode::controlTick() {
             std::lock_guard<std::mutex> lock(ref_mutex_);
             nearest_ref = last_nearest_ref_state_;
             nearest_valid = last_nearest_ref_valid_;
+            has_path_snapshot = has_path_;
+            has_vel_snapshot = has_vel_;
+            has_steer_snapshot = has_steer_;
+            has_accel_snapshot = has_accel_;
+            has_reference_trajectory_snapshot = has_reference_trajectory_;
+            path_states_size = path_states_.size();
+            path_delta_size = path_delta_ref_.size();
+            path_a_size = path_a_ref_.size();
+            path_time_size = path_time_.size();
             velocity_size = velocity_profile_size_;
             steering_size = steering_profile_size_;
             acceleration_size = acceleration_profile_size_;
@@ -767,11 +876,22 @@ void MpcNode::controlTick() {
             "yaw=%.2f rad, vx=%.2f m/s), nearest_ref_dist=%.2f m "
             "(index=%d/%zu), nearest_ref=(%.2f, %.2f, yaw=%.2f rad, "
             "vx=%.2f m/s, valid=%s), lookahead_capture_radius=%.2f m, "
+            "ready_flags={has_odom:%s, has_path:%s, has_vel:%s, "
+            "has_steer:%s, has_accel:%s, has_reference_trajectory:%s}, "
+            "reference_sizes={path_states:%zu, path_delta_ref:%zu, "
+            "path_a_ref:%zu, path_time:%zu}, "
             "profile_sizes={velocity:%zu, steering:%zu, acceleration:%zu}",
             not_ready_reason.c_str(), x0.x, x0.y, x0.yaw, x0.vx,
             nearest_ref_dist, nearest_ref_index, path_points,
             nearest_ref.x, nearest_ref.y, nearest_ref.yaw, nearest_ref.vx,
             nearest_valid ? "yes" : "no", lookahead_capture_radius_,
+            odom_ready ? "true" : "false",
+            has_path_snapshot ? "true" : "false",
+            has_vel_snapshot ? "true" : "false",
+            has_steer_snapshot ? "true" : "false",
+            has_accel_snapshot ? "true" : "false",
+            has_reference_trajectory_snapshot ? "true" : "false",
+            path_states_size, path_delta_size, path_a_size, path_time_size,
             velocity_size, steering_size, acceleration_size);
 
         // No usable reference horizon -> publish zero command.
@@ -802,35 +922,21 @@ void MpcNode::controlTick() {
         return;
     }
 
+    if (std::abs(x0.vx) < 0.05 &&
+        ref_x.size() > 1 &&
+        !ref_u.empty() &&
+        ref_x[1].vx > 0.1 &&
+        std::abs(result.u.a) < 0.05) {
+        result.u.a = 0.4;
+        result.u.delta = ref_u[0].delta;
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "MPC startup assist: applying initial acceleration");
+    }
+
     // -- Publish command [a, δ] --
     std_msgs::msg::Float64MultiArray cmd;
     cmd.data = {result.u.a, result.u.delta};
-
-    double launch_ref_speed = ref_x.empty() ? 0.0 : ref_x.front().vx;
-    for (const auto& ref : ref_x) {
-        if (ref.vx > launch_ref_speed) {
-            launch_ref_speed = ref.vx;
-        }
-    }
-    const bool needs_startup_assist =
-        !ref_u.empty() &&
-        std::abs(x0.vx) <= launch_assist_speed_threshold_ &&
-        std::abs(cmd.data[0]) <= 1e-4 &&
-        launch_ref_speed > 1e-6;
-    if (needs_startup_assist) {
-        const double feedforward_a = std::max(0.2, ref_u.front().a);
-        cmd.data[0] = std::clamp(feedforward_a, mpc_->params().a_min,
-                                  mpc_->params().a_max);
-        cmd.data[1] = std::clamp(ref_u.front().delta, mpc_->params().delta_min,
-                                  mpc_->params().delta_max);
-        RCLCPP_WARN_THROTTLE(
-            this->get_logger(), *this->get_clock(), 2000,
-            "MPC startup assist used. solver_command=(a=%.6f, delta=%.6f), "
-            "assist_command=(a=%.3f, delta=%.3f), current_vx=%.3f m/s, "
-            "max_forward_ref_vx=%.3f m/s, ref_u0=(a=%.3f, delta=%.3f)",
-            result.u.a, result.u.delta, cmd.data[0], cmd.data[1],
-            x0.vx, launch_ref_speed, ref_u.front().a, ref_u.front().delta);
-    }
 
     if (nearZero(cmd.data[0]) && nearZero(cmd.data[1])) {
         logZeroCommandReason("MPC zero: solver failed");

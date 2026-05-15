@@ -55,6 +55,7 @@ private:
     void velocityCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
     void steeringCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
     void accelerationCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
+    void referenceTrajectoryCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
 
     // -- Main control tick --------------------------------------------------
@@ -86,6 +87,7 @@ private:
     // -- ROS I/O ------------------------------------------------------------
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr vel_sub_, steer_sub_, accel_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr reference_traj_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
 
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr cmd_pub_;
@@ -109,6 +111,7 @@ private:
     bool                                has_vel_  = false;
     bool                                has_steer_= false;
     bool                                has_accel_= false;
+    bool                                has_reference_trajectory_ = false;
     std::string                         path_frame_id_;
     bool                                mpc_ready_logged_ = false;
     bool                                steering_fallback_warned_ = false;
